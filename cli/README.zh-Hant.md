@@ -120,6 +120,13 @@ cli/
 
 `convert()` 接收一個 `Job` dataclass——之後要做批次模式，就是建一串 `Job` 然後迴圈跑過去。
 
+## TODO
+
+- 轉換結束後在 macOS 上自動用 Finder 選中輸出的兩個檔案（`open -R`），
+  比照 GUI 版的 `activateFileViewerSelecting` 引導。讓使用者一眼看到「是一
+  *對* 檔案」，降低只 AirDrop 到其中一個的機會。檔案本身已經正確——這純粹
+  是交付體驗的改進。
+
 > 本專案在 AI 輔助下完成。
 
 （English: [README.md](README.md)）

@@ -619,6 +619,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  {image_path.name} + {mov_path.name}")
     print("Import BOTH files together (AirDrop both to the iPad, or add both to "
           "iCloud Photos). See README for pitfalls.")
+    # TODO: 在 macOS 上轉完自動用 Finder 選中這兩個檔案（open -R），
+    # 比照 GUI 版 activateFileViewerSelecting 的引導,降低使用者
+    # 只拿到其中一個的機會。exiftool/ffmpeg 已確保檔案本身正確,
+    # 這純粹是交付體驗的改進。
     return 0
 
 

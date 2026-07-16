@@ -120,6 +120,13 @@ cli/
 
 `convert()` takes a `Job` dataclass — batch mode later is just building a list of `Job`s and looping.
 
+## TODO
+
+- After a conversion on macOS, reveal both output files in Finder (`open -R`),
+  mirroring the GUI app's `activateFileViewerSelecting`. Seeing that it's a
+  *pair* makes it less likely someone AirDrops only one of the two files. The
+  files are already correct — this is purely a delivery-experience improvement.
+
 > Built with AI assistance.
 
 （繁體中文：[README.zh-Hant.md](README.zh-Hant.md)）
