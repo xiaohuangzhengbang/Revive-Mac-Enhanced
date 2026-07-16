@@ -13,6 +13,12 @@ The project ships in two independent versions:
 
 How the lossless pipeline and metadata pairing work is documented in the [CLI Technical notes](cli/README.md).
 
+## Download
+
+Get the macOS app from the [latest release](https://github.com/jui3110/Revive/releases/latest): unzip it and drag `Revive.app` to your Applications folder. The app isn't notarized yet, so allow the first launch by running `xattr -cr /Applications/Revive.app` once in Terminal. Requires macOS 14+.
+
+Prefer to build from source, or want the CLI? See the version READMEs above.
+
 ## Roadmap
 
 - Dark mode
