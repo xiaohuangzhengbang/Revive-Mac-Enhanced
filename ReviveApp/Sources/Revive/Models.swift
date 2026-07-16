@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import os
 
 enum ItemState: Equatable {
     case loading
@@ -183,12 +184,14 @@ final class AppModel: ObservableObject {
     func convert(_ item: QueueItem) async -> Bool {
         item.savedToLibrary = false
         item.state = .converting(Localizer.shared.t("converting"))
+        let settings = item.settings()
+        Logger.conversion.info("convert start: \(item.url.lastPathComponent, privacy: .public) [heic=\(settings.useHEIC), exact=\(settings.exactTrim), mute=\(settings.dropAudio)]")
         do {
             let result = try await LivePhotoEngine.convert(
                 input: item.url,
                 outputDir: workDir,
                 baseName: freeBaseName(),
-                settings: item.settings(),
+                settings: settings,
                 progress: { key in
                     Task { @MainActor in item.state = .converting(Localizer.shared.t(key)) }
                 }
@@ -196,12 +199,15 @@ final class AppModel: ObservableObject {
             item.result = result
             item.checks = await Verifier.verify(imageURL: result.imageURL, movURL: result.movURL)
             if item.checks.contains(where: { $0.status == .fail }) {
+                Logger.conversion.error("verification failed: \(result.baseName, privacy: .public)")
                 item.state = .failed(Localizer.shared.t("verify_failed"))
                 return false
             }
+            Logger.conversion.info("convert ok: \(result.baseName, privacy: .public) [\(result.clipDuration, format: .fixed(precision: 2))s, copied=\(result.videoWasCopied)]")
             item.state = .done
             return true
         } catch {
+            Logger.conversion.error("convert failed: \(error.localizedDescription, privacy: .public)")
             item.state = .failed(error.localizedDescription)
             return false
         }
@@ -246,9 +252,11 @@ final class AppModel: ObservableObject {
                     TempStore.remove(result)  // Photos has its own copy now
                     saved += 1
                 } catch {
+                    Logger.conversion.error("add to Photos failed: \(error.localizedDescription, privacy: .public)")
                     item.state = .failed(error.localizedDescription)
                 }
             }
+            Logger.conversion.info("delivered \(saved) live photo(s) to Photos library")
             lastMessage = saved > 0 ? Localizer.shared.t("saved_n", saved) : nil
         case .folder:
             exportToFolder(results: results)
@@ -273,9 +281,11 @@ final class AppModel: ObservableObject {
                 }
             }
             results.forEach { TempStore.remove($0) }  // exported copies exist now
+            Logger.conversion.info("exported \(results.count) pair(s) to folder")
             lastMessage = Localizer.shared.t("exported_n", results.count, dir.lastPathComponent)
             NSWorkspace.shared.activateFileViewerSelecting(copied)
         } catch {
+            Logger.conversion.error("export failed: \(error.localizedDescription, privacy: .public)")
             lastMessage = Localizer.shared.t("export_failed", error.localizedDescription)
         }
     }
