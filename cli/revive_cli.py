@@ -382,7 +382,7 @@ def verify_pair(
         checks.append(Check(
             label_sit, None,
             "not written (known limitation of the exiftool backend — pairs generally "
-            "still import fine; on macOS run `python3 -m pip install makelive` to enable "
+            "still import fine; on macOS run `python3 -m pip install pyobjc` to enable "
             "the native backend, which writes this track)",
         ))
     checks.append(Check(
@@ -431,7 +431,7 @@ def pick_backend(requested: str, exiftool: str | None) -> str:
         if not apple_backend_available():
             raise RuntimeError(
                 "pyobjc is not installed. Install the native backend with:\n"
-                "  python3 -m pip install makelive\n"
+                "  python3 -m pip install pyobjc\n"
                 "(pulls in the AVFoundation/Quartz bindings this tool uses)"
             )
         return "apple"
@@ -447,12 +447,12 @@ def pick_backend(requested: str, exiftool: str | None) -> str:
         if IS_MACOS:
             print("  note: using exiftool backend. For 100% Live-Photo compliance "
                   "(still-image-time track), install the native backend:\n"
-                  "        python3 -m pip install makelive")
+                  "        python3 -m pip install pyobjc")
         return "exiftool"
     if IS_MACOS:
         raise RuntimeError(
             "No metadata backend available. Install one of:\n"
-            "  python3 -m pip install makelive     (native macOS backend, recommended)\n"
+            "  python3 -m pip install pyobjc     (native macOS backend, recommended)\n"
             "  brew install exiftool               (cross-platform backend)"
         )
     raise RuntimeError("exiftool not found. " + install_hint("exiftool"))

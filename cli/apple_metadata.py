@@ -19,7 +19,7 @@ captured:
                    video; many naive converters omit it.
 
 Requires: pyobjc (pip install pyobjc-framework-AVFoundation pyobjc-framework-Quartz),
-or simply `pip install makelive` which pulls in everything needed.
+or simply `pip install pyobjc` which pulls in everything needed.
 Only importable on macOS.
 """
 
