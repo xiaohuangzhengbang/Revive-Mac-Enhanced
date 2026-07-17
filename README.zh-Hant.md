@@ -15,7 +15,7 @@ Live Photo 是一對靠共用識別碼綁定的檔案：一張靜態圖 + 一段
 
 ## 下載
 
-到 [最新 release](https://github.com/jui3110/Revive/releases/latest) 下載 macOS App：解壓縮後把 `Revive.app` 拖進「應用程式」資料夾。App 尚未經過 Apple 公證，第一次開啟前請在「終端機」執行一次 `xattr -cr /Applications/Revive.app`。需求 macOS 14 以上。
+到 [最新 release](https://github.com/Ed3110/Revive/releases/latest) 下載 macOS App：解壓縮後把 `Revive.app` 拖進「應用程式」資料夾。App 尚未經過 Apple 公證，第一次開啟前請在「終端機」執行一次 `xattr -cr /Applications/Revive.app`。需求 macOS 14 以上。
 
 想從原始碼建置、或要命令列版？見上方各版本的 README。
 
