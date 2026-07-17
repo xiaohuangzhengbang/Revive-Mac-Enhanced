@@ -1,6 +1,25 @@
 import SwiftUI
 import AVKit
 
+/// Wraps AppKit's AVPlayerView instead of SwiftUI's `VideoPlayer`. On macOS,
+/// SwiftUI's `VideoPlayer` crashes on realization in some system versions
+/// (a class-metadata fault in _AVKit_SwiftUI); the AppKit view is rock-solid.
+struct PlayerView: NSViewRepresentable {
+    let player: AVPlayer
+
+    func makeNSView(context: Context) -> AVPlayerView {
+        let view = AVPlayerView()
+        view.player = player
+        view.controlsStyle = .inline
+        view.videoGravity = .resizeAspect
+        return view
+    }
+
+    func updateNSView(_ nsView: AVPlayerView, context: Context) {
+        if nsView.player !== player { nsView.player = player }
+    }
+}
+
 @MainActor
 final class PlayerModel: ObservableObject {
     let player: AVPlayer
@@ -69,7 +88,7 @@ struct EditorView: View {
     }
 
     private var previewArea: some View {
-        VideoPlayer(player: playerModel.player)
+        PlayerView(player: playerModel.player)
             .background(.black)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
