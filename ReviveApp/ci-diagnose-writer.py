@@ -26,6 +26,8 @@ metadata_delay = int(env.get('REVIVE_WRITER_META_DELAY_MS', '0') or '0')
 assert 0 <= metadata_delay <= 250
 env['REVIVE_WRITER_META_DELAY_MS'] = str(metadata_delay)
 env['REVIVE_WRITER_TRACE_DIR'] = str(OUT)
+configuration = env.get('REVIVE_DIAGNOSTIC_CONFIGURATION', 'debug') or 'debug'
+assert configuration in ('debug', 'release')
 engine_ref = env.get('REVIVE_DIAGNOSTIC_ENGINE_REF', '')
 allowed_baselines = {'cfebf02826f2bd9790a82b62d9b1a9e506e6fe46',
                      '7e11055dd2db2942d9b29c9770fbda3a1eaeb331'}
@@ -38,14 +40,15 @@ if engine_ref:
 environment = {'sourceCommit': env.get('GITHUB_SHA'), 'architecture': platform.machine(),
     'iterations': iterations, 'reuseItem': env.get('REVIVE_STRESS_REUSE_ITEM', '0'),
     'metadataDelayMs': metadata_delay,
+    'configuration': configuration,
     'engineReference': engine_ref or env.get('GITHUB_SHA'),
     'engineSourceSHA256': hashlib.sha256((ROOT / 'Sources/Revive/Engine.swift').read_bytes()).hexdigest(),
-    'testFilter': 'EngineTests|testRepeatedNativePreviewsKeepProducingVerifiedPairs',
+    'testFilter': 'EngineTests|ModelParityTests',
     'startedAtUtc': datetime.now(timezone.utc).isoformat()}
 (OUT / 'Environment.json').write_text(json.dumps(environment, indent=2), encoding='utf-8')
 log_path = OUT / 'NativeStress.log'
 test_log = log_path.open('wb')
-process = subprocess.Popen(['swift', 'test', '--filter', environment['testFilter']],
+process = subprocess.Popen(['swift', 'test', '-c', configuration, '--filter', environment['testFilter']],
     cwd=ROOT, env=env, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
 started = time.monotonic()
 last_iteration = None

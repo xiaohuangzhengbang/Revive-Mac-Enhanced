@@ -88,7 +88,8 @@ final class ModelParityTests: XCTestCase {
         var iterations = 6
         var reuseItem = false
         var traceDirectory: String?
-        #if DEBUG
+        // This is test-target configuration, also used to exercise the exact
+        // release optimizer. It is never part of the shipped application.
         let environment = ProcessInfo.processInfo.environment
         if let configured = environment["REVIVE_STRESS_ITERATIONS"] {
             guard let count = Int(configured), (1...1000).contains(count) else {
@@ -99,7 +100,6 @@ final class ModelParityTests: XCTestCase {
         }
         reuseItem = environment["REVIVE_STRESS_REUSE_ITEM"] == "1"
         traceDirectory = environment["REVIVE_WRITER_TRACE_DIR"]
-        #endif
 
         let stressID = UUID().uuidString
         let startedAt = ProcessInfo.processInfo.systemUptime

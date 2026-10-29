@@ -20,6 +20,12 @@ on:
         description: Optional exact historical engine commit for counterfactual diagnosis
         required: false
         default: ''
+      configuration:
+        description: Compile and test the actual release optimizer or debug code
+        required: true
+        type: choice
+        options: [debug, release]
+        default: debug
 
 permissions:
   contents: read
@@ -53,6 +59,7 @@ jobs:
           REVIVE_STRESS_REUSE_ITEM: ${{ inputs.reuse_item && '1' || '0' }}
           REVIVE_WRITER_META_DELAY_MS: ${{ inputs.metadata_delay_ms }}
           REVIVE_DIAGNOSTIC_ENGINE_REF: ${{ inputs.engine_reference }}
+          REVIVE_DIAGNOSTIC_CONFIGURATION: ${{ inputs.configuration }}
         run: python3 ReviveApp/ci-diagnose-writer.py
       - name: Preserve diagnostics even when the native process fails or hangs
         if: always()
