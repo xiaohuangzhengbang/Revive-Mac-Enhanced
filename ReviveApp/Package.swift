@@ -12,7 +12,8 @@ let package = Package(
         .testTarget(
             name: "ReviveTests",
             dependencies: ["Revive"],
-            path: "Tests/ReviveTests"
+            path: "Tests/ReviveTests",
+            resources: [.copy("Fixtures")]
         ),
     ]
 )

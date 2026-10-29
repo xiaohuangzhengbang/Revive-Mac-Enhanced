@@ -24,30 +24,55 @@ struct PlayerView: NSViewRepresentable {
 final class PlayerModel: ObservableObject {
     let player: AVPlayer
     private var endObserver: Any?
+    private var currentURL: URL
+    private var playbackToken = UUID()
 
     init(url: URL) {
+        currentURL = url
         player = AVPlayer(url: url)
         player.isMuted = false
     }
 
+    func use(_ url: URL) {
+        guard currentURL != url else { return }
+        invalidatePlayback()
+        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        currentURL = url
+    }
+
     func seek(to seconds: Double) {
-        player.pause()
+        invalidatePlayback()
         player.seek(to: CMTime(seconds: seconds, preferredTimescale: 600),
                     toleranceBefore: .zero, toleranceAfter: .zero)
     }
 
+    private func invalidatePlayback() {
+        playbackToken = UUID()
+        player.pause()
+        if let endObserver { player.removeTimeObserver(endObserver); self.endObserver = nil }
+    }
+
     /// Play only the selected clip range once.
     func playClip(from start: Double, to end: Double) {
-        if let endObserver { player.removeTimeObserver(endObserver); self.endObserver = nil }
+        invalidatePlayback()
+        guard let item = player.currentItem else { return }
+        let itemID = ObjectIdentifier(item)
+        let token = playbackToken
         player.seek(to: CMTime(seconds: start, preferredTimescale: 600),
-                    toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            guard let self else { return }
-            self.player.play()
-            let boundary = NSValue(time: CMTime(seconds: end, preferredTimescale: 600))
-            self.endObserver = self.player.addBoundaryTimeObserver(
-                forTimes: [boundary], queue: .main
-            ) { [weak self] in
-                self?.player.pause()
+                    toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
+            guard finished else { return }
+            Task { @MainActor [weak self] in
+                guard let self, self.playbackToken == token,
+                      self.player.currentItem.map(ObjectIdentifier.init) == itemID else { return }
+                self.player.play()
+                let boundary = NSValue(time: CMTime(seconds: end, preferredTimescale: 600))
+                self.endObserver = self.player.addBoundaryTimeObserver(forTimes: [boundary], queue: .main) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.playbackToken == token,
+                              self.player.currentItem.map(ObjectIdentifier.init) == itemID else { return }
+                        self.player.pause()
+                    }
+                }
             }
         }
     }
@@ -60,6 +85,7 @@ struct EditorView: View {
     @StateObject private var playerModel: PlayerModel
     @State private var showChecklistDetail = false
     @State private var sealPop = false
+    @State private var showCoverPreview = false
 
     init(item: QueueItem) {
         self.item = item
@@ -67,24 +93,36 @@ struct EditorView: View {
     }
 
     private var isBusy: Bool {
+        if item.operationID != nil { return true }
         if case .converting = item.state { return true }
-        return model.isBatchRunning
+        return model.isBatchRunning || model.isClosing
     }
 
     var body: some View {
         VStack(spacing: 0) {
             previewArea
-            controls
-                .padding(16)
-                .background(.regularMaterial)
+            ScrollView {
+                controls.padding(16)
+            }
+            .frame(maxHeight: 410)
+            .background(.regularMaterial)
+            .disabled(isBusy)
         }
         .navigationTitle(item.url.lastPathComponent)
         .onChange(of: item.state) { _, newState in
             // the moment it becomes a Live Photo, let it come alive once
             if case .done = newState {
-                playerModel.playClip(from: item.trimStart, to: item.trimEnd)
+                if let result = item.result {
+                    playerModel.use(result.movURL)
+                    playerModel.playClip(from: 0, to: result.clipDuration)
+                }
             }
         }
+        .onChange(of: item.previewReady) { _, ready in
+            if ready, let result = item.result { playerModel.use(result.movURL) }
+            else { playerModel.use(item.url) }
+        }
+        .sheet(isPresented: $showCoverPreview) { fullCoverPreview }
     }
 
     private var previewArea: some View {
@@ -112,25 +150,41 @@ struct EditorView: View {
 
     @ViewBuilder private var coverChip: some View {
         if let img = coverThumbnail {
-            VStack(spacing: 3) {
-                Image(nsImage: img).resizable().aspectRatio(contentMode: .fill)
+            Button { showCoverPreview = true } label: {
+                VStack(spacing: 3) {
+                    Image(nsImage: img).resizable().aspectRatio(contentMode: .fit)
                     .frame(width: 76, height: 46)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                     .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.white.opacity(0.85), lineWidth: 2))
-                Text(loc.t("cover_photo")).font(.caption2).foregroundStyle(.white)
+                    Text(loc.t("cover_photo")).font(.caption2).foregroundStyle(.white)
+                }
+                .padding(6)
+                .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
             }
-            .padding(6)
-            .background(.black.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .buttonStyle(.plain)
+            .help(loc.t("preview_full"))
         }
     }
 
-    /// Nearest film-strip frame to the chosen key photo — a live cover preview.
+    /// The actual encoded JPG, never a sparse timeline approximation.
     private var coverThumbnail: NSImage? {
-        guard !item.filmstrip.isEmpty, item.duration > 0 else { return nil }
-        let keyAbs = item.trimStart + item.frameTime
-        let idx = min(max(0, Int(keyAbs / item.duration * Double(item.filmstrip.count))),
-                      item.filmstrip.count - 1)
-        return item.filmstrip[idx]
+        item.coverImage
+    }
+
+    private var fullCoverPreview: some View {
+        VStack(spacing: 12) {
+            Text(loc.t("preview_actual_jpg")).font(.headline)
+            if let image = item.coverImage {
+                Image(nsImage: image).resizable().scaledToFit()
+                    .frame(minWidth: 560, idealWidth: 800, maxWidth: 1100,
+                           minHeight: 320, idealHeight: 520, maxHeight: 750)
+            }
+            Toggle(loc.t("cover_confirm"), isOn: $item.coverConfirmed)
+                .disabled(!item.previewReady || isBusy)
+            Button(loc.t("preview_close")) { showCoverPreview = false }
+                .keyboardShortcut(.cancelAction)
+        }
+        .padding(20)
     }
 
     private var controls: some View {
@@ -140,12 +194,22 @@ struct EditorView: View {
                     duration: item.duration,
                     trimStart: $item.trimStart,
                     trimEnd: $item.trimEnd,
-                    frameTime: $item.frameTime,
+                    frameTime: Binding(get: { item.frameTime }, set: {
+                        item.frameTime = min(max(0, $0), max(0, item.clipDuration - 1.0 / 60_000))
+                    }),
                     thumbnails: item.filmstrip,
-                    onScrub: { playerModel.seek(to: $0) }
+                    onScrub: { playerModel.use(item.url); playerModel.seek(to: $0) }
                 )
                 HStack(spacing: 10) {
-                    Button { playerModel.playClip(from: item.trimStart, to: item.trimEnd) } label: {
+                    Button {
+                        if item.previewReady, let result = item.result {
+                            playerModel.use(result.movURL)
+                            playerModel.playClip(from: 0, to: result.clipDuration)
+                        } else {
+                            playerModel.use(item.url)
+                            playerModel.playClip(from: item.trimStart, to: item.trimEnd)
+                        }
+                    } label: {
                         Label(loc.t("play_clip"), systemImage: "play.fill")
                     }
                     Button(loc.t("whole")) {
@@ -171,7 +235,11 @@ struct EditorView: View {
             SectionCard(title: loc.t("card_options"), systemImage: "slider.horizontal.3") {
                 HStack(spacing: 18) {
                     Toggle(loc.t("opt_heic"), isOn: $item.useHEIC)
+                        .disabled(true)
+                        .help(loc.t("jpg_only"))
                     Toggle(loc.t("opt_exact"), isOn: $item.exactTrim)
+                        .disabled(true)
+                        .help(loc.t("exact_required"))
                     Toggle(loc.t("opt_mute"), isOn: $item.dropAudio)
                     Spacer()
                 }
@@ -179,9 +247,33 @@ struct EditorView: View {
                 .font(.callout)
             }
 
+            SectionCard(title: loc.t("preview_actual_jpg"), systemImage: "photo") {
+                HStack(spacing: 10) {
+                    Button {
+                        Task { _ = await model.convert(item) }
+                    } label: {
+                        Label(loc.t("prepare_preview"), systemImage: "eye")
+                    }
+                    .disabled(isBusy || item.state == .loading)
+                    Button(loc.t("preview_full")) { showCoverPreview = true }
+                        .disabled(!item.previewReady)
+                    Spacer()
+                }
+                Toggle(loc.t("cover_confirm"), isOn: $item.coverConfirmed)
+                    .toggleStyle(.checkbox)
+                    .disabled(!item.previewReady || isBusy)
+                HStack {
+                    Button(loc.t("output_parent")) { model.chooseOutputParent() }
+                    Text(model.outputParent?.path ?? loc.t("output_default"))
+                        .font(.caption).foregroundStyle(.secondary).lineLimit(2)
+                }
+                Text(loc.t("preview_protection_note"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             HStack(spacing: 10) {
                 Button {
-                    Task { await model.convertAndDeliver(item, to: .photoLibrary) }
+                    Task { await model.convertAndDeliver(item, to: .folder) }
                 } label: {
                     if case .converting(let message) = item.state {
                         HStack(spacing: 8) {
@@ -189,15 +281,15 @@ struct EditorView: View {
                             Text(message)
                         }
                     } else {
-                        Label(loc.t("convert_add_photos"), systemImage: "livephoto")
+                        Label(loc.t("convert_export"), systemImage: "folder.badge.plus")
                     }
                 }
                 .buttonStyle(MetallicButtonStyle())
-                .disabled(isBusy)
+                .disabled(isBusy || !item.canDeliver)
 
                 Menu {
-                    Button(loc.t("convert_export")) {
-                        Task { await model.convertAndDeliver(item, to: .folder) }
+                    Button(loc.t("convert_add_photos")) {
+                        Task { await model.convertAndDeliver(item, to: .photoLibrary) }
                     }
                 } label: {
                     Image(systemName: "ellipsis")
@@ -205,7 +297,7 @@ struct EditorView: View {
                 .menuStyle(.borderlessButton)
                 .frame(width: 40)
                 .controlSize(.large)
-                .disabled(isBusy)
+                .disabled(isBusy || !item.canDeliver)
             }
 
             if let result = item.result, !result.videoWasCopied, !item.exactTrim {
@@ -222,7 +314,7 @@ struct EditorView: View {
         .animation(.spring(response: 0.4, dampingFraction: 0.8), value: item.checks.count)
     }
 
-    private var allChecksPass: Bool { item.checks.allSatisfy { $0.status == .pass } }
+    private var allChecksPass: Bool { !item.checks.isEmpty && item.checks.allSatisfy { $0.status == .pass } }
 
     @ViewBuilder private var checklist: some View {
         if allChecksPass {
@@ -285,6 +377,6 @@ struct EditorView: View {
     }
 
     private func clampFrameTime() {
-        item.frameTime = min(max(0, item.frameTime), item.clipDuration)
+        item.frameTime = min(max(0, item.frameTime), max(0, item.clipDuration - 1.0 / 60_000))
     }
 }

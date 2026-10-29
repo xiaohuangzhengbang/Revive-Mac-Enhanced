@@ -43,7 +43,7 @@ struct ContentView: View {
                 } label: {
                     Label(loc.t("convert_all"), systemImage: "square.stack.3d.forward.dottedline")
                 }
-                .disabled(model.items.isEmpty || model.isBatchRunning)
+                .disabled(model.items.isEmpty || model.isBatchRunning || model.activeOperations > 0 || model.isClosing)
 
                 Menu {
                     Picker(loc.t("language"), selection: $loc.lang) {
@@ -88,9 +88,9 @@ struct ContentView: View {
 
             if let message = model.lastMessage {
                 Divider()
-                Label(message, systemImage: "checkmark.circle.fill")
+                Label(message, systemImage: model.lastMessageIsError ? "exclamationmark.triangle.fill" : "info.circle")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(model.lastMessageIsError ? Color.red : Color.secondary)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

@@ -1,0 +1,99 @@
+name: Build and verify enhanced macOS app
+
+on:
+  push:
+    branches: [codex/mac-parity]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-enhanced-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  native-macos:
+    # Standard hosted runners are free for public repositories. Refuse private
+    # repositories and other branches instead of consuming private build minutes.
+    if: github.event.repository.private == false && github.ref == 'refs/heads/codex/mac-parity'
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, verified against actions/checkout
+        with:
+          persist-credentials: false
+
+      - name: Record the build environment
+        run: |
+          mkdir -p ReviveApp/build/ci-evidence
+          {
+            printf 'Commit: %s\nRun: %s/%s/actions/runs/%s\n' "$GITHUB_SHA" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID"
+            sw_vers
+            uname -a
+            xcodebuild -version
+            swift --version
+          } > ReviveApp/build/ci-evidence/Environment.txt
+
+      - name: Run native XCTest, build universal app, verify ad hoc signature and package
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          bash ReviveApp/build.sh 2>&1 | tee ReviveApp/build/ci-evidence/Build.log
+
+      - name: Verify packaged release startup and native UI rendering
+        timeout-minutes: 5
+        run: |
+          shopt -s nullglob
+          builds=(ReviveApp/build/Enhanced-*)
+          [[ ${#builds[@]} -eq 1 ]] || { echo 'Expected exactly one build output directory.' >&2; exit 1; }
+          bash ReviveApp/ci-verify-app.sh "${builds[0]}"
+
+      - name: Upload the verified universal app ZIP
+        id: app
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 2
+        with:
+          name: Revive-Enhanced-macOS-universal-${{ github.sha }}
+          path: ReviveApp/build/Enhanced-*/Revive-Enhanced-macOS.zip
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+      - name: Upload receipts, hashes, signatures, native test logs and smoke diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        timeout-minutes: 2
+        with:
+          name: Revive-Enhanced-ci-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ReviveApp/build/ci-evidence/
+            ReviveApp/build/Enhanced-*/BuildReceipt.json
+            ReviveApp/build/Enhanced-*/BuildReceipt.plist
+            ReviveApp/build/Enhanced-*/NativeTests.log
+            ReviveApp/build/Enhanced-*/NativeBuild.log
+            ReviveApp/build/Enhanced-*/SwiftVersion.txt
+            ReviveApp/build/Enhanced-*/source-sha256.txt
+            ReviveApp/build/Enhanced-*/SignatureVerification.txt
+            ReviveApp/build/Enhanced-*/SHA256SUMS.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Summarize the verification boundary
+        if: always()
+        env:
+          BUILD_RESULT: ${{ job.status }}
+          APP_ARTIFACT_URL: ${{ steps.app.outputs.artifact-url }}
+        run: |
+          {
+            printf 'Enhanced macOS verification result: **%s**.\n\n' "$BUILD_RESULT"
+            if [[ -n "$APP_ARTIFACT_URL" ]]; then
+              printf '[Download the universal app ZIP artifact](%s). Artifacts expire after 7 days.\n\n' "$APP_ARTIFACT_URL"
+            fi
+            printf '%s\n' 'The evidence artifact contains native XCTest/build logs, SHA-256 hashes, ad hoc signature verification, release startup and a DEBUG native UI snapshot when those stages complete.'
+            printf '\n%s\n' 'Signing is ad hoc; this app is not Apple notarized. Photos LIVE playback and user-device acceptance remain unverified. No Photos import or GitHub Release publication is performed.'
+          } >> "$GITHUB_STEP_SUMMARY"

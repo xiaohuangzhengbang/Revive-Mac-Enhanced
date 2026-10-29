@@ -1,5 +1,7 @@
 import XCTest
 import AVFoundation
+import ImageIO
+import CoreGraphics
 @testable import Revive
 
 /// End-to-end tests for the conversion engine. Each test generates a real H.264
@@ -11,6 +13,7 @@ final class EngineTests: XCTestCase {
     override func setUpWithError() throws {
         tmp = FileManager.default.temporaryDirectory
             .appendingPathComponent("ReviveTests-\(UUID().uuidString)")
+            .resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: tmp, withIntermediateDirectories: true)
     }
 
@@ -93,6 +96,214 @@ final class EngineTests: XCTestCase {
 
     // MARK: test fixture
 
+    // A source-frame cover can differ from a re-encoded, trimmed movie. Compare
+    // the encoded JPEG with the actual final MOV frame and read its timed tag.
+    func testExactTrimCoverMatchesFinalMovieAndActualMetadataTime() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        let original = try Data(contentsOf: src)
+        var settings = ConversionSettings()
+        settings.exactTrim = true
+        settings.trimStart = 0.213
+        settings.trimEnd = 0.913
+        settings.frameTime = 0.217
+        let result = try await LivePhotoEngine.convert(
+            input: src, outputDir: tmp.appendingPathComponent("pair"),
+            baseName: "COVER", settings: settings)
+
+        XCTAssertFalse(result.videoWasCopied)
+        XCTAssertGreaterThanOrEqual(result.stillTime, 0)
+        XCTAssertLessThan(result.stillTime, result.clipDuration)
+        let marker = try await stillMetadataRange(result.movURL)
+        XCTAssertTrue(marker.duration.isNumeric)
+        XCTAssertTrue(marker.duration.seconds.isFinite)
+        XCTAssertGreaterThan(marker.duration.seconds, 0)
+        XCTAssertEqual(marker.start.seconds, result.stillTime, accuracy: 0.001)
+        let generator = AVAssetImageGenerator(asset: AVURLAsset(url: result.movURL))
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (frame, actualTime) = try await generator.image(at:
+            CMTime(seconds: result.stillTime, preferredTimescale: 60_000))
+        XCTAssertEqual(actualTime.seconds, result.stillTime, accuracy: 0.001)
+        let imageSource = try XCTUnwrap(CGImageSourceCreateWithURL(result.imageURL as CFURL, nil))
+        let photo = try XCTUnwrap(CGImageSourceCreateImageAtIndex(imageSource, 0, nil))
+        XCTAssertEqual(photo.width, frame.width)
+        XCTAssertEqual(photo.height, frame.height)
+        XCTAssertEqual(photo.width, 320, "Cover must retain full frame resolution")
+        let photoBytes = try rgba(photo)
+        let frameBytes = try rgba(frame)
+        let meanError = zip(photoBytes, frameBytes).reduce(0.0) {
+            $0 + abs(Double($1.0) - Double($1.1))
+        } / Double(photoBytes.count)
+        XCTAssertLessThan(meanError, 4, "JPEG pixels must match the final movie within encoding loss")
+        XCTAssertEqual(try Data(contentsOf: src), original, "Conversion must preserve the source")
+        let leftovers = try FileManager.default.contentsOfDirectory(atPath: result.movURL.deletingLastPathComponent().path)
+        XCTAssertEqual(Set(leftovers), Set(["COVER.JPG", "COVER.MOV"]))
+    }
+
+    func testRejectsExistingImageOrMovieWithoutChangingFiles() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        let original = try Data(contentsOf: src)
+        for ext in ["JPG", "MOV"] {
+            let output = tmp.appendingPathComponent(ext)
+            try FileManager.default.createDirectory(at: output, withIntermediateDirectories: false)
+            let existing = output.appendingPathComponent("PAIR.\(ext)")
+            let sentinel = Data("keep this file".utf8)
+            try sentinel.write(to: existing)
+            do {
+                _ = try await LivePhotoEngine.convert(
+                    input: src, outputDir: output, baseName: "PAIR", settings: ConversionSettings())
+                XCTFail("Existing \(ext) must be rejected")
+            } catch {
+                XCTAssertEqual(try Data(contentsOf: existing), sentinel)
+                XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.path), [existing.lastPathComponent])
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: src), original)
+    }
+
+    func testRejectsInvalidTimesBeforeCreatingOutputs() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        var cases: [ConversionSettings] = []
+        for value in [Double.nan, .infinity, -.infinity, -0.1, 1.0, 2.0] {
+            var settings = ConversionSettings()
+            settings.frameTime = value
+            cases.append(settings)
+        }
+        for value in [Double.nan, .infinity, -0.1, 1.0, 2.0] {
+            var settings = ConversionSettings()
+            settings.trimStart = value
+            cases.append(settings)
+        }
+        for value in [Double.nan, .infinity, -0.1, 2.0] {
+            var settings = ConversionSettings()
+            settings.trimEnd = value
+            cases.append(settings)
+        }
+        var reversed = ConversionSettings()
+        reversed.trimStart = 0.7
+        reversed.trimEnd = 0.3
+        cases.append(reversed)
+        for (index, settings) in cases.enumerated() {
+            let output = tmp.appendingPathComponent("invalid-\(index)")
+            do {
+                _ = try await LivePhotoEngine.convert(
+                    input: src, outputDir: output, baseName: "PAIR", settings: settings)
+                XCTFail("Invalid times must fail: case \(index)")
+            } catch {
+                XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+            }
+        }
+    }
+
+    func testRejectsBasenameTraversalAndSymlinkedOutputDirectory() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        for baseName in ["", ".", "..", "../escape", "nested/name", "nested\\name"] {
+            do {
+                _ = try await LivePhotoEngine.convert(input: src, outputDir: tmp,
+                    baseName: baseName, settings: ConversionSettings())
+                XCTFail("Invalid baseName must fail: \(baseName)")
+            } catch { }
+        }
+        let destination = tmp.appendingPathComponent("real")
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: false)
+        let link = tmp.appendingPathComponent("linked")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: destination)
+        do {
+            _ = try await LivePhotoEngine.convert(input: src, outputDir: link,
+                baseName: "PAIR", settings: ConversionSettings())
+            XCTFail("Symlinked output directories must fail")
+        } catch {
+            XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: destination.path).isEmpty)
+        }
+    }
+
+    func testCancellationLeavesSourceAndNoPair() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        let original = try Data(contentsOf: src)
+        let output = tmp.appendingPathComponent("cancelled")
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await LivePhotoEngine.convert(input: src, outputDir: output,
+                baseName: "PAIR", settings: ConversionSettings())
+        }
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled conversion must fail")
+        } catch {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+            XCTAssertEqual(try Data(contentsOf: src), original)
+        }
+    }
+
+    func testAcceptsSymlinkedParentAndKeepsLeafSymlinkRejected() async throws {
+        let src = tmp.appendingPathComponent("source.mp4")
+        try makeTestVideo(at: src)
+        let realParent = tmp.appendingPathComponent("real-parent", isDirectory: true)
+        try FileManager.default.createDirectory(at: realParent, withIntermediateDirectories: false)
+        let parentAlias = tmp.appendingPathComponent("parent-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: parentAlias, withDestinationURL: realParent)
+
+        // macOS commonly provides temporaryDirectory under the /var alias.
+        // Resolve parent aliases while treating the requested leaf independently.
+        let requested = parentAlias.appendingPathComponent("pair", isDirectory: true)
+        let result = try await LivePhotoEngine.convert(input: src, outputDir: requested,
+            baseName: "PAIR", settings: ConversionSettings())
+        let expected = realParent.appendingPathComponent("pair", isDirectory: true)
+        XCTAssertEqual(result.imageURL.deletingLastPathComponent().path, expected.path)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: requested.appendingPathComponent("PAIR.JPG").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: requested.appendingPathComponent("PAIR.MOV").path))
+
+        let leafAlias = parentAlias.appendingPathComponent("linked-pair", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: leafAlias, withDestinationURL: expected)
+        let before = try Data(contentsOf: result.movURL)
+        do {
+            _ = try await LivePhotoEngine.convert(input: src, outputDir: leafAlias,
+                baseName: "OTHER", settings: ConversionSettings())
+            XCTFail("A leaf symlink must be rejected even below a parent alias")
+        } catch {
+            XCTAssertEqual(try Data(contentsOf: result.movURL), before)
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: expected.path)),
+                           Set(["PAIR.JPG", "PAIR.MOV"]))
+        }
+    }
+
+    private func stillMetadataRange(_ url: URL) async throws -> CMTimeRange {
+        let asset = AVURLAsset(url: url)
+        let tracks = try await asset.loadTracks(withMediaType: .metadata)
+        for track in tracks {
+            let reader = try AVAssetReader(asset: asset)
+            let output = AVAssetReaderTrackOutput(track: track, outputSettings: nil)
+            reader.add(output)
+            let adaptor = AVAssetReaderOutputMetadataAdaptor(assetReaderTrackOutput: output)
+            guard reader.startReading() else { throw reader.error ?? fail("metadata startReading") }
+            while let group = adaptor.nextTimedMetadataGroup() {
+                if group.items.contains(where: { ($0.key as? String) == LivePhotoEngine.keyStillImageTime }) {
+                    return group.timeRange
+                }
+            }
+            if reader.status == .failed { throw reader.error ?? fail("metadata read failed") }
+        }
+        throw fail("still-image-time metadata sample missing")
+    }
+
+    private func rgba(_ image: CGImage) throws -> [UInt8] {
+        var bytes = [UInt8](repeating: 0, count: image.width * image.height * 4)
+        try bytes.withUnsafeMutableBytes { data in
+            guard let context = CGContext(data: data.baseAddress, width: image.width, height: image.height,
+                bitsPerComponent: 8, bytesPerRow: image.width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue | CGBitmapInfo.byteOrder32Big.rawValue)
+            else { throw fail("Cannot create comparison context") }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: CGFloat(image.width), height: CGFloat(image.height)))
+        }
+        return bytes
+    }
+
     /// Writes a short real H.264 .mp4 (solid frames) so the engine has something
     /// genuine to stream-copy.
     private func makeTestVideo(
@@ -119,7 +330,9 @@ final class EngineTests: XCTestCase {
             guard let buf = pb else { continue }
             CVPixelBufferLockBaseAddress(buf, [])
             if let base = CVPixelBufferGetBaseAddress(buf) {
-                memset(base, Int32(30 + i * 3), CVPixelBufferGetDataSize(buf)) // changing shade
+                // Adjacent frames must differ substantially: a wrong cover
+                // frame must not pass the JPEG encoding-loss tolerance.
+                memset(base, Int32(30 + (i * 67) % 200), CVPixelBufferGetDataSize(buf))
             }
             CVPixelBufferUnlockBaseAddress(buf, [])
             while !input.isReadyForMoreMediaData { usleep(2000) }

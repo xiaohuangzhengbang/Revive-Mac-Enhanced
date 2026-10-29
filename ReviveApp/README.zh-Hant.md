@@ -1,3 +1,5 @@
+> 本分支為尚未在 Mac 構建的增強版原始碼；目前狀態與新構建入口請參照 [README.md](README.md)。舊版 --install 入口已移除，構建不會覆蓋既有應用。
+
 # Revive App
 
 把影片轉成 Apple 原況照片的原生 macOS App，影片不重新編碼。

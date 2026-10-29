@@ -44,6 +44,19 @@ struct ConversionResult {
     let baseName: String
     let clipDuration: Double
     let videoWasCopied: Bool
+    /// Actual cover frame timestamp, relative to the exported MOV timeline.
+    let stillTime: Double
+
+    init(imageURL: URL, movURL: URL, assetID: String, baseName: String,
+         clipDuration: Double, videoWasCopied: Bool, stillTime: Double = 0) {
+        self.imageURL = imageURL
+        self.movURL = movURL
+        self.assetID = assetID
+        self.baseName = baseName
+        self.clipDuration = clipDuration
+        self.videoWasCopied = videoWasCopied
+        self.stillTime = stillTime
+    }
 }
 
 /// Converts a video into a Live Photo pair. The video bitstream is copied
@@ -119,47 +132,63 @@ enum LivePhotoEngine {
         settings: ConversionSettings,
         progress: (@Sendable (String) -> Void)? = nil
     ) async throws -> ConversionResult {
+        try Task.checkCancellation()
+        guard input.isFileURL, outputDir.isFileURL,
+              !baseName.isEmpty, baseName != ".", baseName != "..",
+              !baseName.contains("/"), !baseName.contains("\\"), !baseName.contains("\0") else {
+            throw EngineError.cannotWrite("Invalid local output name or directory")
+        }
         let asset = AVURLAsset(url: input)
         let duration = try await asset.load(.duration).seconds
+        guard duration.isFinite, duration > 0,
+              settings.trimStart.isFinite, settings.trimEnd.isFinite,
+              settings.trimStart >= 0, settings.trimStart < duration,
+              settings.trimEnd >= 0, settings.trimEnd <= duration else {
+            throw EngineError.cannotRead("Trim times must be finite and within the source duration")
+        }
         guard let videoTrack = try await asset.loadTracks(withMediaType: .video).first else {
             throw EngineError.noVideoTrack
         }
+        let trimStart = settings.trimStart
+        let trimEnd = settings.trimEnd == 0 ? duration : settings.trimEnd
+        let requestedDuration = trimEnd - trimStart
+        guard requestedDuration > 0 else {
+            throw EngineError.cannotRead("Trim end must be after trim start")
+        }
+        let frameRel = settings.frameTime ?? requestedDuration / 2
+        guard frameRel.isFinite, frameRel >= 0, frameRel < requestedDuration else {
+            throw EngineError.stillExtractionFailed("Cover time must be finite and before the clip end")
+        }
+        try Task.checkCancellation()
+        let outputDirectory = try canonicalOutputDirectory(outputDir)
+        try validateOutputDirectory(outputDirectory)
+        let fm = FileManager.default
+        let imageURL = outputDirectory.appendingPathComponent("\(baseName).\(settings.useHEIC ? "HEIC" : "JPG")")
+        let movURL = outputDirectory.appendingPathComponent("\(baseName).MOV")
+        try requireAbsent(imageURL)
+        try requireAbsent(movURL)
+        try fm.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+        try validateOutputDirectory(outputDirectory)
 
-        let trimStart = max(0, min(settings.trimStart, duration))
-        let trimEnd = settings.trimEnd > 0 ? min(settings.trimEnd, duration) : duration
-        let requestedDuration = max(0.1, trimEnd - trimStart)
-        let frameRel = min(settings.frameTime ?? requestedDuration / 2, requestedDuration)
-        let stillTimeAbs = trimStart + frameRel
-
-        try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
-        let imageURL = outputDir.appendingPathComponent("\(baseName).\(settings.useHEIC ? "HEIC" : "JPG")")
-        let movURL = outputDir.appendingPathComponent("\(baseName).MOV")
-        try? FileManager.default.removeItem(at: imageURL)
-        try? FileManager.default.removeItem(at: movURL)
-
+        // Own a fresh private directory; never delete/reuse a guessed temp name.
+        // Both completed files are committed with non-overwriting moveItem calls.
+        let staging = outputDirectory.appendingPathComponent(".revive-\(UUID().uuidString)", isDirectory: true)
+        try fm.createDirectory(at: staging, withIntermediateDirectories: false,
+                               attributes: [.posixPermissions: 0o700])
+        let stagedIdentity = try fileIdentity(staging)
+        defer { removeOwnedItem(staging, identity: stagedIdentity) }
+        let preparedURL = staging.appendingPathComponent("prepared.MOV")
+        let stagedImage = staging.appendingPathComponent(imageURL.lastPathComponent)
+        let stagedMovie = staging.appendingPathComponent(movURL.lastPathComponent)
         let assetID = UUID().uuidString.uppercased()
-
-        // still first (from the source, frame-accurate, full resolution)
-        // progress emits string KEYS; the UI localizes them (see Localizer)
-        progress?("prog_still")
-        try await extractStill(asset: asset, at: stillTimeAbs, to: imageURL,
-                               heic: settings.useHEIC, assetID: assetID)
-
         let videoWasCopied: Bool
+        let preparedCoverTime: Double
         if settings.exactTrim {
             progress?("prog_exact")
-            let tmp = outputDir.appendingPathComponent(".\(baseName).exact.mov")
-            try? FileManager.default.removeItem(at: tmp)
-            try await exactTrimExport(asset: asset, start: trimStart, end: trimEnd, to: tmp)
-            defer { try? FileManager.default.removeItem(at: tmp) }
-            let trimmed = AVURLAsset(url: tmp)
-            try await passthroughWrite(asset: trimmed, to: movURL, assetID: assetID,
-                                       timeRange: nil, stillTimeAbs: frameRel,
-                                       dropAudio: settings.dropAudio)
+            try await exactTrimExport(asset: asset, start: trimStart, end: trimEnd, to: preparedURL)
+            preparedCoverTime = frameRel
             videoWasCopied = false
         } else {
-            // Only the video track drives keyframe snapping: passthrough can
-            // start only at a sync frame, but a re-encoded track cuts precisely.
             let videoCompatible = await isVideoPassthroughCompatible(videoTrack)
             progress?(videoCompatible ? "prog_mux" : "prog_reencode")
             var range: CMTimeRange? = nil
@@ -171,35 +200,211 @@ enum LivePhotoEngine {
                 let end = CMTime(seconds: trimEnd, preferredTimescale: 600)
                 range = CMTimeRange(start: start, end: end)
             }
+            let preparedStart = range?.start.seconds ?? 0
+            preparedCoverTime = trimStart + frameRel - preparedStart
             videoWasCopied = try await passthroughWrite(
-                asset: asset, to: movURL, assetID: assetID,
-                timeRange: range, stillTimeAbs: stillTimeAbs,
+                asset: asset, to: preparedURL, assetID: assetID,
+                timeRange: range, stillTimeAbs: range?.start ?? .zero,
                 dropAudio: settings.dropAudio)
         }
-
-        let outDuration = try await AVURLAsset(url: movURL).load(.duration).seconds
+        try Task.checkCancellation()
+        let prepared = AVURLAsset(url: preparedURL)
+        let preparedDuration = try await prepared.load(.duration).seconds
+        guard preparedDuration.isFinite, preparedDuration > 0,
+              preparedCoverTime >= 0, preparedCoverTime < preparedDuration else {
+            throw EngineError.stillExtractionFailed("Cover time is outside the rendered video")
+        }
+        progress?("prog_still")
+        let actualTime = try await extractStill(asset: prepared, at: preparedCoverTime,
+                                               to: stagedImage, heic: settings.useHEIC, assetID: assetID)
+        guard actualTime.isNumeric, actualTime.seconds.isFinite,
+              actualTime.seconds >= 0, actualTime.seconds < preparedDuration else {
+            throw EngineError.stillExtractionFailed("Decoder returned an invalid cover frame time")
+        }
+        // Only remux these exact media samples. Re-encoding here would make the
+        // full-resolution JPEG cease to be the final MOV's selected frame.
+        try await passthroughWrite(asset: prepared, to: stagedMovie, assetID: assetID,
+                                   timeRange: nil, stillTimeAbs: actualTime,
+                                   dropAudio: settings.dropAudio, allowVideoReencode: false)
+        let outDuration = try await AVURLAsset(url: stagedMovie).load(.duration).seconds
+        guard outDuration.isFinite, outDuration > actualTime.seconds else {
+            throw EngineError.cannotWrite("Final movie does not contain the cover frame")
+        }
+        try Task.checkCancellation()
+        try validateOutputDirectory(outputDirectory)
+        try requireAbsent(imageURL)
+        try requireAbsent(movURL)
+        let imageIdentity = try fileIdentity(stagedImage)
+        let movieIdentity = try fileIdentity(stagedMovie)
+        var committed = false
+        defer {
+            if !committed {
+                removeOwnedItem(imageURL, identity: imageIdentity)
+                removeOwnedItem(movURL, identity: movieIdentity)
+            }
+        }
+        try fm.moveItem(at: stagedImage, to: imageURL)
+        try Task.checkCancellation()
+        try fm.moveItem(at: stagedMovie, to: movURL)
+        try Task.checkCancellation()
+        committed = true
         return ConversionResult(
             imageURL: imageURL, movURL: movURL, assetID: assetID, baseName: baseName,
-            clipDuration: outDuration, videoWasCopied: videoWasCopied
+            clipDuration: outDuration, videoWasCopied: videoWasCopied, stillTime: actualTime.seconds
         )
+    }
+
+    // MARK: output ownership
+
+    private static func canonicalOutputDirectory(_ url: URL) throws -> URL {
+        // /var and /tmp are normal macOS parent aliases. Resolve parents once,
+        // but inspect the requested leaf first so it cannot alias another pair.
+        do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard attrs[.type] as? FileAttributeType == .typeDirectory else {
+                throw EngineError.cannotWrite("Output directory must be a real directory")
+            }
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+            (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+            // A missing leaf is created only after validating the canonical path.
+        }
+        return url.deletingLastPathComponent().resolvingSymlinksInPath()
+            .appendingPathComponent(url.lastPathComponent, isDirectory: true)
+    }
+
+    private static func validateOutputDirectory(_ url: URL) throws {
+        var current = url.standardizedFileURL
+        while true {
+            do {
+                let attrs = try FileManager.default.attributesOfItem(atPath: current.path)
+                guard attrs[.type] as? FileAttributeType == .typeDirectory else {
+                    throw EngineError.cannotWrite("Output directory components must be real directories")
+                }
+            } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+                // A new directory is allowed, but every existing ancestor is checked.
+            }
+            let parent = current.deletingLastPathComponent()
+            if parent.path == current.path { break }
+            current = parent
+        }
+    }
+
+    private static func requireAbsent(_ url: URL) throws {
+        // attributesOfItem also detects a dangling symbolic link.
+        do {
+            _ = try FileManager.default.attributesOfItem(atPath: url.path)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+            (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
+            return
+        }
+        throw EngineError.cannotWrite("Output already exists: \(url.lastPathComponent)")
+    }
+
+    private struct FileIdentity: Equatable {
+        let device: UInt64
+        let inode: UInt64
+    }
+
+    private static func fileIdentity(_ url: URL) throws -> FileIdentity {
+        let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+        guard let device = attrs[.systemNumber] as? NSNumber,
+              let inode = attrs[.systemFileNumber] as? NSNumber else {
+            throw EngineError.cannotWrite("Cannot determine output ownership")
+        }
+        return FileIdentity(device: device.uint64Value, inode: inode.uint64Value)
+    }
+
+    private static func removeOwnedItem(_ url: URL, identity: FileIdentity) {
+        guard (try? fileIdentity(url)) == identity else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    /// AVFoundation callbacks may stop arriving after cancellation or failure.
+    /// Resume the awaiting task exactly once, independently of dispatch groups.
+    private final class WriteCompletion: @unchecked Sendable {
+        private let lock = NSLock()
+        private var continuation: CheckedContinuation<Void, Error>?
+        private var result: Result<Void, Error>?
+        private var timer: DispatchSourceTimer?
+        private var lastProgress = DispatchTime.now().uptimeNanoseconds
+
+        var isFinished: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return result != nil
+        }
+
+        func begin(_ continuation: CheckedContinuation<Void, Error>, timer: DispatchSourceTimer) -> Bool {
+            lock.lock()
+            if let result {
+                lock.unlock()
+                timer.cancel()
+                continuation.resume(with: result)
+                return false
+            }
+            self.continuation = continuation
+            self.timer = timer
+            lock.unlock()
+            return true
+        }
+
+        func noteProgress() {
+            lock.lock(); lastProgress = DispatchTime.now().uptimeNanoseconds; lock.unlock()
+        }
+
+        var hasStalled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return result == nil && DispatchTime.now().uptimeNanoseconds - lastProgress > 120_000_000_000
+        }
+
+        func finish(_ outcome: Result<Void, Error>, beforeResume: () -> Void = {}) {
+            lock.lock()
+            guard result == nil else { lock.unlock(); return }
+            result = outcome
+            let waiting = continuation
+            continuation = nil
+            let watchdog = timer
+            timer = nil
+            lock.unlock()
+            watchdog?.cancel()
+            beforeResume()
+            waiting?.resume(with: outcome)
+        }
     }
 
     // MARK: still extraction
 
     private static func extractStill(
         asset: AVAsset, at time: Double, to url: URL, heic: Bool, assetID: String
-    ) async throws {
+    ) async throws -> CMTime {
+        try Task.checkCancellation()
         let generator = AVAssetImageGenerator(asset: asset)
         generator.appliesPreferredTrackTransform = true
         generator.requestedTimeToleranceBefore = .zero
         generator.requestedTimeToleranceAfter = .zero
-        let cmTime = CMTime(seconds: time, preferredTimescale: 600)
+        let duration = try await asset.load(.duration)
+        var cmTime = CMTime(seconds: time, preferredTimescale: 60_000)
+        // A valid value just below the end can round up to the excluded endpoint.
+        if cmTime >= duration {
+            cmTime = duration - CMTime(value: 1, timescale: 60_000)
+        }
+        guard cmTime.isNumeric, cmTime >= .zero, cmTime < duration else {
+            throw EngineError.stillExtractionFailed("Cover time is outside the rendered video")
+        }
         let cgImage: CGImage
+        let actualTime: CMTime
         do {
-            (cgImage, _) = try await generator.image(at: cmTime)
+            (cgImage, actualTime) = try await withTaskCancellationHandler {
+                try await generator.image(at: cmTime)
+            } onCancel: {
+                generator.cancelAllCGImageGeneration()
+            }
         } catch {
+            if Task.isCancelled { throw EngineError.cancelled }
             throw EngineError.stillExtractionFailed(error.localizedDescription)
         }
+
+        try Task.checkCancellation()
 
         let type = heic ? UTType.heic : UTType.jpeg
         guard let dest = CGImageDestinationCreateWithURL(url as CFURL, type.identifier as CFString, 1, nil) else {
@@ -213,6 +418,7 @@ enum LivePhotoEngine {
         guard CGImageDestinationFinalize(dest) else {
             throw EngineError.stillExtractionFailed("image encoding failed")
         }
+        return actualTime
     }
 
     // MARK: exact trim (one visually lossless-ish re-encode, frame accurate)
@@ -230,7 +436,13 @@ enum LivePhotoEngine {
             start: CMTime(seconds: start, preferredTimescale: 600),
             end: CMTime(seconds: end, preferredTimescale: 600)
         )
-        await session.export()
+        try Task.checkCancellation()
+        await withTaskCancellationHandler {
+            await session.export()
+        } onCancel: {
+            session.cancelExport()
+        }
+        try Task.checkCancellation()
         if session.status != .completed {
             throw EngineError.cannotWrite(session.error?.localizedDescription ?? "export failed")
         }
@@ -329,8 +541,10 @@ enum LivePhotoEngine {
     @discardableResult
     private static func passthroughWrite(
         asset: AVAsset, to url: URL, assetID: String,
-        timeRange: CMTimeRange?, stillTimeAbs: Double, dropAudio: Bool = false
+        timeRange: CMTimeRange?, stillTimeAbs: CMTime, dropAudio: Bool = false,
+        allowVideoReencode: Bool = true
     ) async throws -> Bool {
+        try Task.checkCancellation()
         let reader: AVAssetReader
         do { reader = try AVAssetReader(asset: asset) }
         catch { throw EngineError.cannotRead(error.localizedDescription) }
@@ -339,6 +553,10 @@ enum LivePhotoEngine {
         let writer: AVAssetWriter
         do { writer = try AVAssetWriter(outputURL: url, fileType: .mov) }
         catch { throw EngineError.cannotWrite(error.localizedDescription) }
+        defer {
+            if reader.status == .reading { reader.cancelReading() }
+            if writer.status == .writing { writer.cancelWriting() }
+        }
         writer.metadata = topLevelMetadata(assetID: assetID)
 
         var videoCopied = true
@@ -346,7 +564,12 @@ enum LivePhotoEngine {
         let tracks = try await asset.load(.tracks)
         for track in tracks where track.mediaType == .video || (track.mediaType == .audio && !dropAudio) {
             guard let formatDesc = try await track.load(.formatDescriptions).first else { continue }
-            let compatible = isPassthroughCompatible(formatDesc, mediaType: track.mediaType)
+            let compatible = track.mediaType == .video && !allowVideoReencode
+                ? passthroughVideoCodecs.contains(CMFormatDescriptionGetMediaSubType(formatDesc))
+                : isPassthroughCompatible(formatDesc, mediaType: track.mediaType)
+            guard allowVideoReencode || track.mediaType != .video || compatible else {
+                throw EngineError.cannotWrite("Final movie would require another video encode")
+            }
 
             // reader: nil = deliver compressed samples (copy); settings = decode
             let readerSettings: [String: Any]?
@@ -390,10 +613,11 @@ enum LivePhotoEngine {
             writer.add(input)
             pairs.append((output, input))
         }
-        guard !pairs.isEmpty else { throw EngineError.noVideoTrack }
+        guard pairs.contains(where: { $0.1.mediaType == .video }) else { throw EngineError.noVideoTrack }
 
         let metaInput = AVAssetWriterInput(mediaType: .metadata, outputSettings: nil,
                                            sourceFormatHint: try stillImageTimeFormatDescription())
+        metaInput.mediaTimeScale = 60_000
         let adaptor = AVAssetWriterInputMetadataAdaptor(assetWriterInput: metaInput)
         guard writer.canAdd(metaInput) else { throw EngineError.cannotWrite("can't add still-image-time metadata track") }
         writer.add(metaInput)
@@ -410,12 +634,29 @@ enum LivePhotoEngine {
         let stillGroup = AVTimedMetadataGroup(
             items: [item(keyStillImageTime, NSNumber(value: 0), "com.apple.metadata.datatype.int8")],
             timeRange: CMTimeRange(
-                start: CMTime(seconds: stillTimeAbs, preferredTimescale: 6000),
-                duration: CMTime(value: 200, timescale: 3000)
+                start: stillTimeAbs,
+                duration: CMTime(value: 1, timescale: 60_000)
             )
         )
 
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+        let completion = WriteCompletion()
+        let finishQueue = DispatchQueue(label: "revive.finish")
+        try await withTaskCancellationHandler {
+          try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "revive.watchdog"))
+            watchdog.schedule(deadline: .now() + 5, repeating: 5)
+            watchdog.setEventHandler {
+                finishQueue.async {
+                    guard completion.hasStalled else { return }
+                    completion.finish(.failure(EngineError.cannotWrite("Media writer made no progress for 120 seconds"))) {
+                        reader.cancelReading()
+                        writer.cancelWriting()
+                    }
+                }
+            }
+            // A suspended dispatch source must be resumed even on early cancel.
+            watchdog.resume()
+            guard completion.begin(cont, timer: watchdog) else { return }
             let group = DispatchGroup()
             let errorLock = NSLock()
             var firstError: Error?
@@ -433,6 +674,7 @@ enum LivePhotoEngine {
                     recordError(EngineError.cannotWrite(
                         "still-image-time append failed: \(writer.error?.localizedDescription ?? "?")"))
                 }
+                completion.noteProgress()
                 metaInput.markAsFinished()
                 group.leave()
             }
@@ -450,6 +692,7 @@ enum LivePhotoEngine {
                                     "sample append failed: \(writer.error?.localizedDescription ?? "?")"))
                                 done = true; input.markAsFinished(); group.leave(); return
                             }
+                            completion.noteProgress()
                         } else {
                             done = true; input.markAsFinished(); group.leave(); return
                         }
@@ -457,7 +700,8 @@ enum LivePhotoEngine {
                 }
             }
 
-            group.notify(queue: DispatchQueue(label: "revive.finish")) {
+            group.notify(queue: finishQueue) {
+                guard !completion.isFinished else { return }
                 if reader.status == .failed {
                     recordError(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
                 }
@@ -465,7 +709,17 @@ enum LivePhotoEngine {
                     if writer.status != .completed {
                         recordError(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing did not complete"))
                     }
-                    if let e = firstError { cont.resume(throwing: e) } else { cont.resume() }
+                    if let e = firstError { completion.finish(.failure(e)) }
+                    else { completion.finish(.success(())) }
+                }
+            }
+          }
+        } onCancel: {
+            // Serialize native cancellation with finishWriting registration.
+            finishQueue.async {
+                completion.finish(.failure(EngineError.cancelled)) {
+                    reader.cancelReading()
+                    writer.cancelWriting()
                 }
             }
         }

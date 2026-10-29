@@ -1,57 +1,73 @@
-#!/bin/zsh
-# Build Revive.app from the SwiftPM package (no Xcode project needed).
-#   ./build.sh              build only (build/Revive.app; NOT registered with
-#                           the system, so it won't duplicate "Open With")
-#   ./build.sh --install    build + install to /Applications + register
-#   ./build.sh --install --refresh-shell   ...and restart Dock/Finder to
-#                           refresh a stubborn icon cache
-set -e
+#!/bin/bash
+# Build and verify a new native app; never install over an existing application.
+set -euo pipefail
 cd "$(dirname "$0")"
 
-swift build -c release
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "BLOCKED: a Mac with the macOS SDK and Swift 5.9+ is required." >&2
+  exit 78
+fi
+MODE="universal"
+if [[ $# -gt 0 ]]; then
+  [[ $# -eq 1 && "$1" == "--native" ]] || {
+    echo "Usage: bash build.sh [--native]. No installation or overwrite is performed." >&2
+    exit 64
+  }
+  MODE="native"
+fi
+for tool in swift codesign lipo ditto plutil; do
+  command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 78; }
+done
+ROOT="$(pwd -P)"
+OUT="$ROOT/build/Enhanced-$(date +%Y%m%d-%H%M%S)-$(uuidgen)"
+mkdir -p "$OUT"
+RECEIPT="$OUT/BuildReceipt.json"
+PLIST="$OUT/BuildReceipt.plist"
+plutil -create xml1 "$PLIST"
+plutil -insert status -string FAILED "$PLIST"
+plutil -insert applePhotosLivePlaybackVerified -bool false "$PLIST"
+plutil -insert buildMode -string "$MODE" "$PLIST"
+plutil -insert sourcePath -string "$ROOT" "$PLIST"
+finish_receipt() { plutil -convert json -o "$RECEIPT" "$PLIST"; }
+trap finish_receipt EXIT
 
-APP="build/Revive.app"
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp .build/release/Revive "$APP/Contents/MacOS/Revive"
+find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -name '*.mp4' \) -exec shasum -a 256 {} \; > "$OUT/source-sha256.txt"
+swift --version > "$OUT/SwiftVersion.txt"
+swift test 2>&1 | tee "$OUT/NativeTests.log"
+plutil -insert nativeTests -string PASS "$PLIST"
+
+ARCH_FLAGS=(--arch "$(uname -m)")
+if [[ "$MODE" == "universal" ]]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi
+swift build -c release "${ARCH_FLAGS[@]}" 2>&1 | tee "$OUT/NativeBuild.log"
+BIN_DIR="$(swift build -c release "${ARCH_FLAGS[@]}" --show-bin-path)"
+BIN="$BIN_DIR/Revive"
+[[ -x "$BIN" ]] || { echo "No built executable: $BIN" >&2; exit 1; }
+ARCHITECTURES="$(lipo -archs "$BIN")"
+if [[ "$MODE" == "universal" ]]; then
+  [[ "$ARCHITECTURES" == *arm64* && "$ARCHITECTURES" == *x86_64* ]] || {
+    echo "Build is not universal: $ARCHITECTURES" >&2; exit 1;
+  }
+fi
+
+APP="$OUT/Revive.app"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Fonts"
+cp "$BIN" "$APP/Contents/MacOS/Revive"
+chmod 755 "$APP/Contents/MacOS/Revive"
 cp Support/Info.plist "$APP/Contents/Info.plist"
-echo "APPL????" > "$APP/Contents/PkgInfo"
-
-# app icon (regenerate if the source script changed)
-if [ ! -f Support/icon/Revive.icns ] || [ Support/make_icon.py -nt Support/icon/Revive.icns ]; then
-  python3 Support/make_icon.py >/dev/null 2>&1 || echo "  (icon generation skipped — needs Pillow)"
-fi
-[ -f Support/icon/Revive.icns ] && cp Support/icon/Revive.icns "$APP/Contents/Resources/Revive.icns"
-
-# bundle the Great Vibes brand font (OFL) — ATSApplicationFontsPath="Fonts"
-# auto-registers it at launch, so the wordmark renders on any Mac
-mkdir -p "$APP/Contents/Resources/Fonts"
-cp Support/fonts/GreatVibes-Regular.ttf "$APP/Contents/Resources/Fonts/"
-cp Support/fonts/OFL.txt "$APP/Contents/Resources/Fonts/"
-
-# ad-hoc signature so TCC (photo-library permission) works locally
+printf 'APPL????' > "$APP/Contents/PkgInfo"
+cp Support/icon/Revive.icns "$APP/Contents/Resources/Revive.icns"
+cp Support/fonts/GreatVibes-Regular.ttf Support/fonts/OFL.txt "$APP/Contents/Resources/Fonts/"
+cp ../LICENSE "$APP/Contents/Resources/LICENSE.txt"
 codesign --force --sign - "$APP"
-
-echo
-echo "✅ 建置完成: $(pwd)/$APP"
-
-if [[ "$*" == *--install* ]]; then
-  LSREG=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-  pkill -x Revive 2>/dev/null || true
-  rm -rf /Applications/Revive.app
-  cp -R "$APP" /Applications/Revive.app
-  codesign --force --sign - /Applications/Revive.app
-  # register ONLY the /Applications copy; unregister the build copy so
-  # "Open With" never shows duplicates
-  "$LSREG" -u "$(pwd)/$APP" 2>/dev/null || true
-  "$LSREG" -f /Applications/Revive.app
-  /System/Library/CoreServices/pbs -flush 2>/dev/null || true
-  echo "✅ 已安裝: /Applications/Revive.app"
-  if [[ "$*" == *--refresh-shell* ]]; then
-    killall Dock 2>/dev/null || true
-    killall Finder 2>/dev/null || true
-    echo "   (已重啟 Dock/Finder 刷新圖示)"
-  fi
-else
-  echo "   安裝到應用程式: ./build.sh --install"
-fi
+codesign --verify --strict --verbose=2 "$APP" 2> "$OUT/SignatureVerification.txt"
+plutil -lint "$APP/Contents/Info.plist"
+plutil -insert architectures -string "$ARCHITECTURES" "$PLIST"
+plutil -insert nativeBuild -string PASS "$PLIST"
+plutil -insert signature -string AD_HOC_VERIFIED_NOT_NOTARIZED "$PLIST"
+plutil -insert appPath -string "$APP" "$PLIST"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/Revive-Enhanced-macOS.zip"
+shasum -a 256 "$OUT/Revive-Enhanced-macOS.zip" > "$OUT/SHA256SUMS.txt"
+plutil -replace status -string BUILT_TESTED_NOT_DEVICE_ACCEPTED "$PLIST"
+echo "Built: $APP"
+echo "Archive: $OUT/Revive-Enhanced-macOS.zip"
+echo "No application was installed. Photos LIVE playback still requires device acceptance."

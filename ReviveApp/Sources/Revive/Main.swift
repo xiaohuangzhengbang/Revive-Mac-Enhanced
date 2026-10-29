@@ -17,10 +17,24 @@ struct ReviveApp: App {
 /// Handles Finder integration: "Open With → Revive", drag-onto-icon, and the
 /// right-click Services entry. All routes funnel the dropped video files into
 /// the shared queue.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.servicesProvider = self
         NSUpdateDynamicServices()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let model = AppModel.shared
+        guard model.activeOperations > 0 else {
+            TempStore.sweep()
+            return .terminateNow
+        }
+        model.requestTermination {
+            TempStore.sweep()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func application(_ application: NSApplication, open urls: [URL]) {
