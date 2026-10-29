@@ -15,7 +15,7 @@ if [[ $# -gt 0 ]]; then
   }
   MODE="native"
 fi
-for tool in swift codesign lipo ditto plutil; do
+for tool in swift codesign lipo ditto plutil python3; do
   command -v "$tool" >/dev/null || { echo "Missing build tool: $tool" >&2; exit 78; }
 done
 ROOT="$(pwd -P)"
@@ -32,7 +32,10 @@ finish_receipt() { plutil -convert json -o "$RECEIPT" "$PLIST"; }
 trap finish_receipt EXIT
 
 find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -name '*.mp4' -o -name '*.mov' \) -exec shasum -a 256 {} \; > "$OUT/source-sha256.txt"
+shasum -a 256 build.sh ci-*.py ci-*.sh >> "$OUT/source-sha256.txt"
 swift --version > "$OUT/SwiftVersion.txt"
+python3 ci-recovery-counterfactual.py
+plutil -insert recoveryCounterfactual -string EXPECTED_FAILURE_VERIFIED "$PLIST"
 swift test 2>&1 | tee "$OUT/NativeTests.log"
 plutil -insert nativeTests -string PASS "$PLIST"
 plutil -insert debugNativeTests -string PASS "$PLIST"
@@ -40,6 +43,8 @@ plutil -insert debugNativeTests -string PASS "$PLIST"
 # missed the intermittent readiness callback stall reproduced in Release.
 swift test -c release 2>&1 | tee -a "$OUT/NativeTests.log"
 plutil -insert releaseNativeTests -string PASS "$PLIST"
+python3 ci-verify-writer-recovery.py
+plutil -insert nativeStallRecovery -string VERIFIED "$PLIST"
 
 ARCH_FLAGS=(--arch "$(uname -m)")
 if [[ "$MODE" == "universal" ]]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi

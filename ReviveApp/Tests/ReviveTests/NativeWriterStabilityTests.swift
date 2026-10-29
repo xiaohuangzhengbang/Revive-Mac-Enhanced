@@ -76,30 +76,12 @@ final class NativeWriterStabilityTests: XCTestCase {
                 .appendingPathComponent("Replay-\(UUID().uuidString)", isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-                let asset = AVURLAsset(url: source)
-                let generator = AVAssetImageGenerator(asset: asset)
-                generator.appliesPreferredTrackTransform = true
-                generator.requestedTimeToleranceBefore = .zero
-                generator.requestedTimeToleranceAfter = .zero
-                let (image, actualTime) = try await generator.image(
-                    at: CMTime(seconds: 1.49, preferredTimescale: 60_000))
-                XCTAssertTrue(actualTime.isNumeric && actualTime.seconds >= 0 && actualTime.seconds < duration)
-                guard actualTime.isNumeric, actualTime.seconds >= 0, actualTime.seconds < duration else {
-                    throw replayError("Cover extraction returned an invalid actual frame time")
-                }
-                let assetID = UUID().uuidString.uppercased()
-                let imageURL = directory.appendingPathComponent("REPLAY.JPG")
-                let movieURL = directory.appendingPathComponent("REPLAY.MOV")
-                let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
-                    imageURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
-                let properties: [CFString: Any] = [
-                    kCGImageDestinationLossyCompressionQuality: 0.98,
-                    kCGImagePropertyMakerAppleDictionary: [LivePhotoEngine.makerAppleAssetIDKey: assetID],
-                ]
-                CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-                guard CGImageDestinationFinalize(destination) else {
-                    throw replayError("Replay JPEG encoding failed")
-                }
+                let prepared = try await prepareReplayPair(source: source, directory: directory)
+                let asset = prepared.asset
+                let assetID = prepared.assetID
+                let imageURL = prepared.imageURL
+                let movieURL = prepared.movieURL
+                let actualTime = prepared.actualTime
 
                 let copied = try await LivePhotoEngine.passthroughWrite(
                     asset: asset, to: movieURL, assetID: assetID, timeRange: nil,
@@ -137,6 +119,163 @@ final class NativeWriterStabilityTests: XCTestCase {
                 throw error
             }
         }
+    }
+
+    /// Three deterministic native writes must actually stop with unread audio,
+    /// then be resumed by the unmodified production recovery timer.
+    func testNativeStalledWriterResumesViaFallbackAndPreservesPair() async throws {
+        for iteration in 1...3 { try await exerciseNativeRecovery(mode: .positive, iteration: iteration) }
+    }
+
+    /// With the identical callback loss but no recovery, the real writer must
+    /// remain incomplete over the live observation window and cancel safely.
+    func testNativeStalledWriterCannotCompleteWithRecoveryDisabled() async throws {
+        try await exerciseNativeRecovery(mode: .negative, iteration: 1)
+    }
+
+    private func exerciseNativeRecovery(mode: NativeWriterRecoveryProbe.Mode, iteration: Int) async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_writer_stall_prepared",
+                                                    withExtension: "mov", subdirectory: "Fixtures"))
+        let originalHash = try SafeExport.sha256(source)
+        guard originalHash == "9dd43aa46f2a77c386999a3dd493c3811b32ed335c17cee860f0dd34c8c8e334" else {
+            throw replayError("Native recovery must use the exact retained stall fixture")
+        }
+        let videoBefore = try await compressedTracks(source, mediaType: .video)
+        let audioBefore = try await compressedTracks(source, mediaType: .audio)
+        let audioSamples = audioBefore.reduce(0) { $0 + $1.sampleCount }
+        let videoSamples = videoBefore.reduce(0) { $0 + $1.sampleCount }
+        guard audioSamples == 142, videoSamples == 91 else {
+            throw replayError("Native recovery source sample counts changed")
+        }
+        let negativeHeld: XCTestExpectation? = mode == .negative
+            ? expectation(description: "real native negative control stayed stalled") : nil
+        let recorder = try NativeWriterRecoveryProbe(mode: mode, expectedAudioSamples: audioSamples,
+            notifyNegativeHold: { negativeHeld?.fulfill() })
+        let directory = recorder.receiptURL.deletingLastPathComponent()
+            .appendingPathComponent("WriterRecovery-Pair-\(recorder.operationID)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let prepared = try await prepareReplayPair(source: source, directory: directory)
+        recorder.note("test.context", fields: ["iteration": iteration, "assetID": prepared.assetID,
+            "sourceFixtureSHA256": originalHash, "expectedAudioSamples": audioSamples,
+            "expectedVideoSamples": videoSamples, "movieURL": prepared.movieURL.path])
+        let operation = Task {
+            try await LivePhotoEngine.passthroughWrite(asset: prepared.asset, to: prepared.movieURL,
+                assetID: prepared.assetID, timeRange: nil, stillTimeAbs: prepared.actualTime,
+                dropAudio: false, allowVideoReencode: false, probe: recorder.probe)
+        }
+        let deadline = Task {
+            do { try await Task.sleep(nanoseconds: 12_000_000_000) }
+            catch { return }
+            recorder.note("test.deadline.expired")
+            operation.cancel()
+        }
+        defer { deadline.cancel() }
+        var cancelled = false
+        do {
+            if mode == .negative {
+                await fulfillment(of: [try XCTUnwrap(negativeHeld)], timeout: 10)
+                recorder.note("test.cancellation.requested")
+                operation.cancel()
+                switch await operation.result {
+                case .success:
+                    throw replayError("Native negative control unexpectedly completed without recovery")
+                case .failure(let error):
+                    guard case EngineError.cancelled = error else { throw error }
+                    cancelled = true
+                    recorder.note("test.cancellation.completed")
+                }
+                deadline.cancel()
+                let failures = recorder.validationFailures(negativeCancelled: true)
+                guard failures.isEmpty else { throw replayError(failures.joined(separator: "; ")) }
+                guard try SafeExport.sha256(source) == originalHash else {
+                    throw replayError("Negative native control changed the source fixture")
+                }
+                try recorder.finish(status: "PASS", details: ["iteration": iteration,
+                    "sourceFixtureSHA256": originalHash, "expectedVideoSamples": videoSamples,
+                    "sourceUnchanged": true, "cancelledThroughNativeFailureDrain": true,
+                    "pairValidation": "NOT_APPLICABLE_CANCELLED_NEGATIVE_CONTROL"])
+            } else {
+                let copied = try await operation.value
+                deadline.cancel()
+                let failures = recorder.validationFailures()
+                guard failures.isEmpty else {
+                    throw replayError("RECOVERY_EXPECTED_APPEND_NOT_OBSERVED: " + failures.joined(separator: "; "))
+                }
+                let checks = await Verifier.verify(imageURL: prepared.imageURL, movURL: prepared.movieURL,
+                    expectedDuration: prepared.duration, expectedStillTime: prepared.actualTime.seconds,
+                    expectedAudio: true)
+                let videoAfter = try await compressedTracks(prepared.movieURL, mediaType: .video)
+                let audioAfter = try await compressedTracks(prepared.movieURL, mediaType: .audio)
+                let videoPreserved = assertPreserved(videoBefore, videoAfter, mediaType: "recovered video")
+                let audioPreserved = assertPreserved(audioBefore, audioAfter, mediaType: "recovered audio")
+                let unchanged = try SafeExport.sha256(source) == originalHash
+                guard copied, !checks.isEmpty, checks.allSatisfy({ $0.status == .pass }),
+                      videoPreserved, audioPreserved, unchanged else {
+                    throw replayError("Recovered native pair failed strict file or compressed payload verification")
+                }
+                let passedChecks = checks.map { ["code": $0.code, "detail": $0.detail, "status": "pass"] }
+                let pair: [String: Any] = ["assetID": prepared.assetID,
+                    "imageSHA256": try SafeExport.sha256(prepared.imageURL),
+                    "movieSHA256": try SafeExport.sha256(prepared.movieURL),
+                    "imageFile": directory.lastPathComponent + "/" + prepared.imageURL.lastPathComponent,
+                    "movieFile": directory.lastPathComponent + "/" + prepared.movieURL.lastPathComponent,
+                    "sourceUnchanged": unchanged, "compressedVideoPreserved": videoPreserved,
+                    "compressedAudioPreserved": audioPreserved, "videoSamples": videoSamples,
+                    "audioSamples": audioSamples, "checks": passedChecks]
+                recorder.note("test.files.verified", fields: pair)
+                let finalFailures = recorder.validationFailures(requireFilesVerified: true)
+                guard finalFailures.isEmpty else { throw replayError(finalFailures.joined(separator: "; ")) }
+                try recorder.finish(status: "PASS", details: ["iteration": iteration,
+                    "sourceFixtureSHA256": originalHash, "expectedVideoSamples": videoSamples,
+                    "sourceUnchanged": unchanged, "pairValidation": "STRICT_JPG_MOV_AND_COMPRESSED_PAYLOAD_PASS",
+                    "pair": pair])
+            }
+        } catch {
+            operation.cancel()
+            _ = await operation.result
+            let failures = recorder.validationFailures(negativeCancelled: cancelled)
+            let marker = mode == .positive ? "RECOVERY_EXPECTED_APPEND_NOT_OBSERVED: " : ""
+            let detail = marker + error.localizedDescription + "; " + failures.joined(separator: "; ")
+            try recorder.finish(status: "FAIL", details: ["iteration": iteration,
+                "sourceFixtureSHA256": originalHash, "expectedVideoSamples": videoSamples,
+                "sourceUnchanged": (try? SafeExport.sha256(source)) == originalHash,
+                "error": detail, "validationFailures": failures, "retainedOutput": directory.path])
+            throw replayError(detail)
+        }
+    }
+
+    private struct PreparedReplay {
+        let asset: AVURLAsset
+        let assetID: String
+        let imageURL: URL
+        let movieURL: URL
+        let actualTime: CMTime
+        let duration: Double
+    }
+
+    private func prepareReplayPair(source: URL, directory: URL) async throws -> PreparedReplay {
+        let asset = AVURLAsset(url: source)
+        let duration = try await asset.load(.duration).seconds
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.requestedTimeToleranceBefore = .zero
+        generator.requestedTimeToleranceAfter = .zero
+        let (image, actualTime) = try await generator.image(
+            at: CMTime(seconds: 1.49, preferredTimescale: 60_000))
+        guard actualTime.isNumeric, actualTime.seconds >= 0, actualTime.seconds < duration else {
+            throw replayError("Cover extraction returned an invalid actual frame time")
+        }
+        let assetID = UUID().uuidString.uppercased()
+        let imageURL = directory.appendingPathComponent("REPLAY.JPG")
+        let movieURL = directory.appendingPathComponent("REPLAY.MOV")
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            imageURL as CFURL, UTType.jpeg.identifier as CFString, 1, nil))
+        let properties: [CFString: Any] = [kCGImageDestinationLossyCompressionQuality: 0.98,
+            kCGImagePropertyMakerAppleDictionary: [LivePhotoEngine.makerAppleAssetIDKey: assetID]]
+        CGImageDestinationAddImage(destination, image, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { throw replayError("Replay JPEG encoding failed") }
+        return PreparedReplay(asset: asset, assetID: assetID, imageURL: imageURL, movieURL: movieURL,
+                              actualTime: actualTime, duration: duration)
     }
 
     private func compressedTracks(_ url: URL, mediaType: AVMediaType) async throws -> [CompressedTrack] {

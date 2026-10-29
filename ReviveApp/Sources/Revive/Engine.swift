@@ -700,6 +700,11 @@ enum LivePhotoEngine {
             return stage
         }
 
+        var progressAgeSeconds: Double {
+            lock.lock(); defer { lock.unlock() }
+            return Double(DispatchTime.now().uptimeNanoseconds - lastProgress) / 1_000_000_000
+        }
+
         var hasStalled: Bool {
             lock.lock(); defer { lock.unlock() }
             return result == nil && DispatchTime.now().uptimeNanoseconds - lastProgress > 120_000_000_000
@@ -886,11 +891,21 @@ enum LivePhotoEngine {
     //
     // Returns true iff the video track was stream-copied (bit-for-bit).
 
+    /// Per-invocation instrumentation for native integration tests. Application
+    /// callers leave this nil; no environment switch or global state can enable
+    /// callback fault injection in a normal conversion.
+    struct WriterProbe: Sendable {
+        let allowsNativeCallback: @Sendable (String) -> Bool
+        let yieldAfterAppend: @Sendable (String, String, AVAssetWriterInput) -> Bool
+        let allowsFallback: @Sendable (String) -> Bool
+        let observe: @Sendable (String, [String: Any]) -> Void
+    }
+
     @discardableResult
     static func passthroughWrite(
         asset: AVAsset, to url: URL, assetID: String,
         timeRange: CMTimeRange?, stillTimeAbs: CMTime, dropAudio: Bool = false,
-        allowVideoReencode: Bool = true
+        allowVideoReencode: Bool = true, probe: WriterProbe? = nil
     ) async throws -> Bool {
         try Task.checkCancellation()
         let reader: AVAssetReader
@@ -1036,6 +1051,27 @@ enum LivePhotoEngine {
 
         let completion = WriteCompletion()
         let finishQueue = DispatchQueue(label: "revive.finish")
+        let readerIdentity = String(describing: ObjectIdentifier(reader))
+        let writerIdentity = String(describing: ObjectIdentifier(writer))
+        let observeWriter: @Sendable (String, [String: Any]) -> Void = { name, extra in
+            guard let probe else { return }
+            probe.observe(name, extra.merging([
+                "readerIdentity": readerIdentity, "writerIdentity": writerIdentity,
+                "readerStatus": reader.status.rawValue, "writerStatus": writer.status.rawValue,
+                "stage": completion.currentStage,
+                "progressAgeSeconds": completion.progressAgeSeconds,
+                "uptimeNanos": DispatchTime.now().uptimeNanoseconds
+            ]) { _, current in current })
+        }
+        let observePump: @Sendable (String, WritePump, AVAssetWriterInput, String, [String: Any]) -> Void = {
+            name, pump, input, origin, extra in
+            guard probe != nil else { return }
+            var fields = pump.snapshot(ready: input.isReadyForMoreMediaData)
+            fields["mediaType"] = input.mediaType.rawValue
+            fields["origin"] = origin
+            observeWriter(name, fields.merging(extra) { _, current in current })
+        }
+        observeWriter("writer.started", [:])
         let failure = FailureCoordinator(finishQueue: finishQueue, observe: trace.map { trace in
             { name, fields in trace.event(name, phase: "draining", fields: fields) }
         })
@@ -1109,7 +1145,7 @@ enum LivePhotoEngine {
             guard completion.begin(cont, timer: watchdog) else { return }
             // Enter every input before any callback can fail or finish. Forced
             // stop runs on these same queues, even for inputs never made ready.
-            let driveMetadata: @Sendable () -> Void = {
+            let driveMetadata: @Sendable (String) -> Void = { origin in
                 guard !metaPump.isFinished, !failure.shouldStop else { return }
                 metaPump.note("readiness callback")
                 trace?.event("readiness", fields: ["queue": metaPump.queue.label,
@@ -1129,6 +1165,7 @@ enum LivePhotoEngine {
                                                                "writerStatus": writer.status.rawValue])
                 metaPump.note("metadata appended", appendedPTS: stillTimeAbs.seconds)
                 completion.noteProgress()
+                observePump("append.success", metaPump, metaInput, origin, ["bufferSamples": 1])
                 metaPump.finish {
                     if !failure.shouldStop, writer.status == .writing {
                         metaPump.note("markAsFinished entered")
@@ -1136,17 +1173,31 @@ enum LivePhotoEngine {
                         metaInput.markAsFinished()
                         metaPump.note("markAsFinished returned")
                         trace?.event("markAsFinished.return", fields: ["queue": metaPump.queue.label])
+                        observePump("input.finished", metaPump, metaInput, origin, [:])
                     }
                 }
             }
             metaPump.installFallbackDriver(shouldStop: { failure.shouldStop },
-                isReady: { metaInput.isReadyForMoreMediaData }, drive: driveMetadata,
-                onRecovery: { trace?.event("fallback.drive", fields: ["queue": metaPump.queue.label]) })
-            metaInput.requestMediaDataWhenReady(on: metaPump.queue, using: driveMetadata)
+                isReady: {
+                    let ready = metaInput.isReadyForMoreMediaData
+                    observePump("pump.poll", metaPump, metaInput, "fallback", [:])
+                    return ready && (probe?.allowsFallback(metaInput.mediaType.rawValue) ?? true)
+                }, drive: { driveMetadata("fallback") },
+                onRecovery: {
+                    trace?.event("fallback.drive", fields: ["queue": metaPump.queue.label])
+                    observePump("fallback.enter", metaPump, metaInput, "fallback", [:])
+                })
+            metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
+                if let probe {
+                    guard !metaPump.isFinished, !failure.shouldStop,
+                          probe.allowsNativeCallback(metaInput.mediaType.rawValue) else { return }
+                }
+                driveMetadata("native")
+            }
 
             for (index, (output, input)) in pairs.enumerated() {
                 let pump = mediaPumps[index]
-                let driveMedia: @Sendable () -> Void = {
+                let driveMedia: @Sendable (String) -> Void = { origin in
                     guard !pump.isFinished, !failure.shouldStop else { return }
                     pump.note("readiness callback")
                     trace?.event("readiness", fields: ["queue": pump.queue.label,
@@ -1175,6 +1226,15 @@ enum LivePhotoEngine {
                             trace?.event("append.return", fields: ["queue": pump.queue.label, "result": true,
                                                                  "writerStatus": writer.status.rawValue])
                             completion.noteProgress()
+                            if let probe {
+                                observePump("append.success", pump, input, origin,
+                                            ["bufferSamples": CMSampleBufferGetNumSamples(sbuf)])
+                                if probe.yieldAfterAppend(input.mediaType.rawValue, origin, input) {
+                                    pump.note("controlled yield after append")
+                                    observePump("driver.yielded", pump, input, origin, [:])
+                                    return
+                                }
+                            }
                         } else {
                             trace?.event("read.return", fields: ["queue": pump.queue.label, "hasSample": false,
                                                                 "readerStatus": reader.status.rawValue])
@@ -1183,6 +1243,7 @@ enum LivePhotoEngine {
                                 return
                             }
                             pump.note("EOF")
+                            observePump("input.eof", pump, input, origin, [:])
                             trace?.event("EOF", fields: ["queue": pump.queue.label,
                                                          "readerStatus": reader.status.rawValue])
                             pump.finish {
@@ -1192,6 +1253,7 @@ enum LivePhotoEngine {
                                     input.markAsFinished()
                                     pump.note("markAsFinished returned")
                                     trace?.event("markAsFinished.return", fields: ["queue": pump.queue.label])
+                                    observePump("input.finished", pump, input, origin, [:])
                                 }
                             }
                             return
@@ -1202,9 +1264,22 @@ enum LivePhotoEngine {
                                                            "ready": input.isReadyForMoreMediaData])
                 }
                 pump.installFallbackDriver(shouldStop: { failure.shouldStop },
-                    isReady: { input.isReadyForMoreMediaData }, drive: driveMedia,
-                    onRecovery: { trace?.event("fallback.drive", fields: ["queue": pump.queue.label]) })
-                input.requestMediaDataWhenReady(on: pump.queue, using: driveMedia)
+                    isReady: {
+                        let ready = input.isReadyForMoreMediaData
+                        observePump("pump.poll", pump, input, "fallback", [:])
+                        return ready && (probe?.allowsFallback(input.mediaType.rawValue) ?? true)
+                    }, drive: { driveMedia("fallback") },
+                    onRecovery: {
+                        trace?.event("fallback.drive", fields: ["queue": pump.queue.label])
+                        observePump("fallback.enter", pump, input, "fallback", [:])
+                    })
+                input.requestMediaDataWhenReady(on: pump.queue) {
+                    if let probe {
+                        guard !pump.isFinished, !failure.shouldStop,
+                              probe.allowsNativeCallback(input.mediaType.rawValue) else { return }
+                    }
+                    driveMedia("native")
+                }
             }
 
             failure.activate(pumps: pumps) { error in
@@ -1240,6 +1315,8 @@ enum LivePhotoEngine {
                     trace?.event("cancelWriting.return", fields: ["writerStatus": writer.status.rawValue])
                 }
                 trace?.event("completion.failure", phase: "failed")
+                observeWriter("completion.failure", ["error": reportedError.localizedDescription,
+                                                       "details": details])
                 completion.finish(.failure(reportedError))
             }
             group.notify(queue: finishQueue) {
@@ -1258,10 +1335,12 @@ enum LivePhotoEngine {
                 }
                 completion.noteStage("finishWriting entered")
                 trace?.event("finishWriting.enter", phase: "finishing writer")
+                observeWriter("writer.finish.enter", [:])
                 writer.finishWriting {
                     completion.noteStage("finishWriting callback")
                     trace?.event("finishWriting.callback", fields: ["writerStatus": writer.status.rawValue,
                                                                     "shouldStop": failure.shouldStop])
+                    observeWriter("writer.finish.callback", [:])
                     guard !failure.shouldStop else { return }
                     if writer.status != .completed {
                         failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing did not complete"))
@@ -1269,6 +1348,7 @@ enum LivePhotoEngine {
                     }
                     failure.finishSuccessfully {
                         trace?.event("completion.success", phase: "completed")
+                        observeWriter("completion.success", [:])
                         completion.finish(.success(()))
                     }
                 }
