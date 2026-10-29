@@ -24,19 +24,20 @@ struct PlayerView: NSViewRepresentable {
 final class PlayerModel: ObservableObject {
     let player: AVPlayer
     private var endObserver: Any?
-    private var currentURL: URL
+    private var currentURL: URL?
     private var playbackToken = UUID()
 
-    init(url: URL) {
+    init(url: URL?) {
         currentURL = url
-        player = AVPlayer(url: url)
+        if let url { player = AVPlayer(url: url) }
+        else { player = AVPlayer() }
         player.isMuted = false
     }
 
-    func use(_ url: URL) {
+    func use(_ url: URL?) {
         guard currentURL != url else { return }
         invalidatePlayback()
-        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        player.replaceCurrentItem(with: url.map { AVPlayerItem(url: $0) })
         currentURL = url
     }
 
@@ -89,7 +90,8 @@ struct EditorView: View {
 
     init(item: QueueItem) {
         self.item = item
-        _playerModel = StateObject(wrappedValue: PlayerModel(url: item.url))
+        _playerModel = StateObject(wrappedValue: PlayerModel(
+            url: item.previewReady ? item.result?.movURL : item.sourcePlaybackURL))
     }
 
     private var isBusy: Bool {
@@ -120,13 +122,19 @@ struct EditorView: View {
         }
         .onChange(of: item.previewReady) { _, ready in
             if ready, let result = item.result { playerModel.use(result.movURL) }
-            else { playerModel.use(item.url) }
+            else { playerModel.use(item.sourcePlaybackURL) }
         }
         .sheet(isPresented: $showCoverPreview) { fullCoverPreview }
     }
 
     private var previewArea: some View {
-        PlayerView(player: playerModel.player)
+        Group {
+            if item.isStillImage, !item.previewReady, let image = item.thumbnail {
+                Image(nsImage: image).resizable().scaledToFit()
+            } else {
+                PlayerView(player: playerModel.player)
+            }
+        }
             .background(.black)
             .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
             .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
@@ -140,8 +148,8 @@ struct EditorView: View {
 
     private var liveBadge: some View {
         HStack(spacing: 5) {
-            Image(systemName: "livephoto")
-            Text("LIVE").font(.caption2.weight(.bold))
+            Image(systemName: item.isStillImage ? "photo" : "livephoto")
+            Text(item.isStillImage ? loc.t("image_motion_short") : "LIVE").font(.caption2.weight(.bold))
         }
         .foregroundStyle(.white)
         .padding(.horizontal, 9).padding(.vertical, 5)
@@ -198,16 +206,28 @@ struct EditorView: View {
                         item.frameTime = min(max(0, $0), max(0, item.clipDuration - 1.0 / 60_000))
                     }),
                     thumbnails: item.filmstrip,
-                    onScrub: { playerModel.use(item.url); playerModel.seek(to: $0) }
+                    onScrub: { time in
+                        if let source = item.sourcePlaybackURL {
+                            playerModel.use(source)
+                            playerModel.seek(to: time)
+                        }
+                    }
                 )
                 HStack(spacing: 10) {
                     Button {
                         if item.previewReady, let result = item.result {
                             playerModel.use(result.movURL)
                             playerModel.playClip(from: 0, to: result.clipDuration)
-                        } else {
-                            playerModel.use(item.url)
+                        } else if let source = item.sourcePlaybackURL {
+                            playerModel.use(source)
                             playerModel.playClip(from: item.trimStart, to: item.trimEnd)
+                        } else if item.isStillImage {
+                            Task {
+                                if await model.convert(item), let result = item.result {
+                                    playerModel.use(result.movURL)
+                                    playerModel.playClip(from: 0, to: result.clipDuration)
+                                }
+                            }
                         }
                     } label: {
                         Label(loc.t("play_clip"), systemImage: "play.fill")
@@ -245,6 +265,10 @@ struct EditorView: View {
                 }
                 .toggleStyle(.checkbox)
                 .font(.callout)
+                if item.isStillImage {
+                    Text(loc.t("image_motion_note"))
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
 
             SectionCard(title: loc.t("preview_actual_jpg"), systemImage: "photo") {
@@ -286,6 +310,15 @@ struct EditorView: View {
                 }
                 .buttonStyle(MetallicButtonStyle())
                 .disabled(isBusy || !item.canDeliver)
+
+                if item.isStillImage {
+                    Button {
+                        Task { _ = await model.exportAnimatedGIF(item) }
+                    } label: {
+                        Label(loc.t("export_gif"), systemImage: "photo.stack")
+                    }
+                    .disabled(isBusy || !item.canDeliver)
+                }
 
                 Menu {
                     Button(loc.t("convert_add_photos")) {

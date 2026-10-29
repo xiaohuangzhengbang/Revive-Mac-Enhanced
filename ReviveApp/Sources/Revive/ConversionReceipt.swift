@@ -5,6 +5,8 @@ struct ConversionReceipt: Encodable {
     let application = "Revive Mac Enhanced"
     let sourcePath: String
     let sourceSHA256Before: String
+    let sourceKind: String
+    let motionEffect: String?
     let settings: PreviewSettings
     let assetIdentifier: String
     let actualStillTime: Double
@@ -24,9 +26,12 @@ struct ConversionReceipt: Encodable {
     var checks: [Check] = []
     var error: String?
 
-    init(source: URL, sourceSHA256: String, settings: PreviewSettings, result: ConversionResult, expectedAudio: Bool) {
+    init(source: URL, sourceSHA256: String, settings: PreviewSettings, result: ConversionResult,
+         expectedAudio: Bool, sourceKind: String = "video", motionEffect: String? = nil) {
         sourcePath = source.path
         sourceSHA256Before = sourceSHA256
+        self.sourceKind = sourceKind
+        self.motionEffect = motionEffect
         self.settings = settings
         assetIdentifier = result.assetID
         actualStillTime = result.stillTime

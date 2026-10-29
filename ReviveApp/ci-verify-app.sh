@@ -113,5 +113,30 @@ grep -q 'actual JPG/MOV preview verified' "$EVIDENCE/NativeUISmoke.log"
 [[ -s "$SNAPSHOT" ]]
 sips -g pixelWidth -g pixelHeight "$SNAPSHOT" > "$EVIDENCE/NativeUISnapshotDimensions.txt"
 plutil -insert debugNativeUIRendering -string PNG_RENDERED "$PLIST"
+
+# The image fixture is retained by the real still-motion acceptance test. Run
+# the actual model preview/GIF path and capture its existing image controls.
+shopt -s nullglob
+image_fixtures=("$EVIDENCE"/StillMotion-Core-debug-*/TEST_still_source.png)
+[[ ${#image_fixtures[@]} -eq 1 ]] || { echo 'Expected one retained still-motion fixture.' >&2; exit 1; }
+IMAGE_SNAPSHOT="$EVIDENCE/NativeImageUISmoke.png"
+REVIVE_LANG=en REVIVE_UI_SMOKE_GIF=1 "$DEBUG_BIN" --ui-smoke \
+  "${image_fixtures[0]}" "$IMAGE_SNAPSHOT" > "$EVIDENCE/NativeImageUISmoke.log" 2>&1 &
+DEBUG_PID=$!
+for ((second = 0; second < 90; second++)); do
+  kill -0 "$DEBUG_PID" 2>/dev/null || break
+  sleep 1
+done
+if kill -0 "$DEBUG_PID" 2>/dev/null; then
+  echo 'Native image preview and real GIF export exceeded 90 seconds.' >&2
+  exit 1
+fi
+wait "$DEBUG_PID"
+DEBUG_PID=""
+grep -q 'image motion + GIF verified' "$EVIDENCE/NativeImageUISmoke.log"
+grep -q 'UI smoke OK' "$EVIDENCE/NativeImageUISmoke.log"
+[[ -s "$IMAGE_SNAPSHOT" ]]
+sips -g pixelWidth -g pixelHeight "$IMAGE_SNAPSHOT" > "$EVIDENCE/NativeImageUISnapshotDimensions.txt"
+plutil -insert debugImageMotionAndGIF -string VERIFIED "$PLIST"
 plutil -replace status -string PACKAGED_STARTUP_AND_UI_SMOKE_PASSED "$PLIST"
 printf '%s\n' 'Packaged release startup and DEBUG native UI rendering passed. Photos LIVE playback is unverified.'

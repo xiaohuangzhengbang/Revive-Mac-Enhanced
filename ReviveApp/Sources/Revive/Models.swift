@@ -1,6 +1,8 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import ImageIO
+import UniformTypeIdentifiers
 import os
 
 enum ItemState: Equatable {
@@ -28,8 +30,15 @@ struct PreviewSettings: Equatable, Codable {
 
 @MainActor
 final class QueueItem: ObservableObject, Identifiable {
+    static let videoExtensions = ["mp4", "mov", "m4v"]
+    static let imageExtensions = ["jpg", "jpeg", "png", "heic", "heif"]
     let id = UUID()
+    /// Always the original user file, including when motion is rendered from a photo.
     let url: URL
+    var isStillImage: Bool { Self.imageExtensions.contains(url.pathExtension.lowercased()) }
+    @Published var motionSourceURL: URL?
+    @Published var gifExportURL: URL?
+    var sourcePlaybackURL: URL? { isStillImage ? motionSourceURL : url }
     @Published var duration: Double = 0
     @Published var thumbnail: NSImage?
     @Published var filmstrip: [NSImage] = []
@@ -86,6 +95,8 @@ final class QueueItem: ObservableObject, Identifiable {
         checks = []
         savedToLibrary = false
         exportDirectory = nil
+        gifExportURL = nil
+        motionSourceURL = nil
         if let result { TempStore.remove(result) }
         result = nil
         if state == .done { state = .ready }
@@ -93,6 +104,26 @@ final class QueueItem: ObservableObject, Identifiable {
 
     private func load() async {
         do {
+            if isStillImage {
+                guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                      let image = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                        kCGImageSourceCreateThumbnailFromImageAlways: true,
+                        kCGImageSourceCreateThumbnailWithTransform: true,
+                        kCGImageSourceThumbnailMaxPixelSize: 480
+                      ] as CFDictionary) else {
+                    throw NSError(domain: "Revive", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: "无法解码这张图片，请选择有效的 JPG、PNG 或 HEIC。"])
+                }
+                duration = 3
+                trimStart = 0
+                trimEnd = 3
+                frameTime = 1.5
+                let photo = NSImage(cgImage: image, size: .zero)
+                thumbnail = photo
+                filmstrip = Array(repeating: photo, count: 10)
+                state = .ready
+                return
+            }
             let asset = AVURLAsset(url: url)
             let length = try await asset.load(.duration).seconds
             guard length.isFinite, length >= 3 else {
@@ -210,7 +241,7 @@ final class AppModel: ObservableObject {
 
     func add(urls: [URL]) {
         guard !isClosing else { return }
-        for url in urls where ["mp4", "mov", "m4v"].contains(url.pathExtension.lowercased()) {
+        for url in urls where (QueueItem.videoExtensions + QueueItem.imageExtensions).contains(url.pathExtension.lowercased()) {
             let source = url.resolvingSymlinksInPath().standardizedFileURL
             guard !items.contains(where: { $0.url == source }) else { continue }
             items.append(QueueItem(url: source))
@@ -233,7 +264,7 @@ final class AppModel: ObservableObject {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie, .movie]
+        panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie, .movie, .jpeg, .png, .heic, .heif]
         if panel.runModal() == .OK { add(urls: panel.urls) }
     }
 
@@ -276,8 +307,20 @@ final class AppModel: ObservableObject {
             guard stillCurrent(item, operation: operation, snapshot: captured) else { return false }
             let directory = try TempStore.makeOperationDirectory()
             folder = directory
+            let videoInput: URL
+            if item.isStillImage {
+                item.state = .converting(Localizer.shared.t("image_motion_rendering"))
+                videoInput = directory.appendingPathComponent("PHOTO_MOTION.MP4")
+                try await StillMotion.generate(source: source, to: videoInput, duration: 3)
+                guard stillCurrent(item, operation: operation, snapshot: captured) else {
+                    TempStore.removeDirectory(directory)
+                    return false
+                }
+            } else {
+                videoInput = source
+            }
             let result = try await LivePhotoEngine.convert(
-                input: source, outputDir: directory, baseName: "IMG_LIVE", settings: item.settings(),
+                input: videoInput, outputDir: directory, baseName: "IMG_LIVE", settings: item.settings(),
                 progress: { key in
                     Task { @MainActor in
                         guard self.stillCurrent(item, operation: operation, snapshot: captured) else { return }
@@ -288,7 +331,7 @@ final class AppModel: ObservableObject {
                 TempStore.removeDirectory(directory)
                 return false
             }
-            let sourceAsset = AVURLAsset(url: source)
+            let sourceAsset = AVURLAsset(url: videoInput)
             let expectedAudio = captured.muted ? false : !(try await sourceAsset.loadTracks(withMediaType: .audio)).isEmpty
             let checks = await Verifier.verify(imageURL: result.imageURL, movURL: result.movURL,
                                                 expectedDuration: item.clipDuration, expectedStillTime: result.stillTime,
@@ -313,6 +356,7 @@ final class AppModel: ObservableObject {
                 return false
             }
             item.result = result
+            item.motionSourceURL = item.isStillImage ? videoInput : nil
             item.checks = checks
             item.coverImage = cover
             item.preparedSettings = captured
@@ -335,9 +379,97 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func convertAndDeliver(_ item: QueueItem, to destination: Destination) async {
+    /// Export the already previewed motion, preserving both original image and prepared pair.
+    @discardableResult
+    func exportAnimatedGIF(_ item: QueueItem, revealOutput: Bool = true) async -> Bool {
+        guard !isClosing, !isBatchRunning, item.isStillImage, item.canDeliver,
+              let prepared = item.result, let expectedSourceHash = item.inputSHA256,
+              let expectedImageHash = item.imageSHA256, let expectedMovieHash = item.movieSHA256 else {
+            lastMessageIsError = true
+            lastMessage = Localizer.shared.t("gif_requires_preview")
+            return false
+        }
+        let captured = item.snapshot
+        let operation = UUID()
+        item.operationID = operation
+        activeOperations += 1
+        item.state = .converting(Localizer.shared.t("gif_exporting"))
+        defer { finishOperation(item, operation: operation) }
+        let source = item.url
+        let parent = outputParent ?? source.deletingLastPathComponent()
+        var destinationFolder: URL?
+        do {
+            let currentHashes = try await Task.detached(priority: .userInitiated) {
+                (try SafeExport.sha256(source), try SafeExport.sha256(prepared.imageURL),
+                 try SafeExport.sha256(prepared.movURL))
+            }.value
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { throw error("当前操作已失效。") }
+            guard currentHashes.0 == expectedSourceHash, currentHashes.1 == expectedImageHash,
+                  currentHashes.2 == expectedMovieHash else {
+                item.previewReady = false
+                item.coverConfirmed = false
+                throw error("原图或已确认的预览文件已改变，请重新生成预览。")
+            }
+            let directory = try await Task.detached {
+                try SafeExport.createOutputDirectory(parent: parent, baseName: "Revive_GIF")
+            }.value
+            destinationFolder = directory
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { throw error("当前操作已失效。") }
+            let gifURL = directory.appendingPathComponent("IMG_MOTION.GIF")
+            let summary = try await StillMotion.exportGIF(movieURL: prepared.movURL, to: gifURL)
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { throw error("当前操作已失效。") }
+            let hashesAfter = try await Task.detached(priority: .userInitiated) {
+                (try SafeExport.sha256(source), try SafeExport.sha256(prepared.imageURL),
+                 try SafeExport.sha256(prepared.movURL), try SafeExport.sha256(gifURL))
+            }.value
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { throw error("当前操作已失效。") }
+            guard hashesAfter.0 == expectedSourceHash, hashesAfter.1 == expectedImageHash,
+                  hashesAfter.2 == expectedMovieHash else {
+                item.previewReady = false
+                item.coverConfirmed = false
+                throw error("原图或成片在 GIF 导出期间发生变化，已停止交付。")
+            }
+            let receipt: [String: Any] = [
+                "schemaVersion": 1, "application": "Revive Mac Enhanced",
+                "status": "ANIMATED_GIF_VERIFIED", "sourceKind": "still_image",
+                "sourcePath": source.path, "sourceSHA256Before": expectedSourceHash,
+                "sourceSHA256After": hashesAfter.0, "inputUnchanged": true,
+                "motionEffect": "local_gentle_zoom_pan", "generatedPersonMotion": false,
+                "previewedMovieReused": true, "coverHumanConfirmed": true,
+                "preparedMovieSHA256": expectedMovieHash, "gifSHA256": hashesAfter.3,
+                "frameCount": summary.frameCount, "duration": summary.duration,
+                "width": summary.width, "height": summary.height, "loopCount": 0,
+                "decodedFramesVerified": true, "applePhotosLivePlaybackVerified": false
+            ]
+            let data = try JSONSerialization.data(withJSONObject: receipt, options: [.prettyPrinted, .sortedKeys])
+            _ = try await Task.detached { try SafeExport.writeReport(data, to: directory) }.value
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { throw error("当前操作已失效。") }
+            item.gifExportURL = gifURL
+            item.exportDirectory = directory
+            item.savedToLibrary = false
+            item.state = .done
+            lastMessageIsError = false
+            lastMessage = Localizer.shared.t("gif_exported", directory.lastPathComponent)
+            if revealOutput { NSWorkspace.shared.activateFileViewerSelecting([gifURL]) }
+            return true
+        } catch {
+            if let directory = destinationFolder,
+               !FileManager.default.fileExists(atPath: directory.appendingPathComponent("检查报告.json").path),
+               let data = try? JSONSerialization.data(withJSONObject: ["status": "FAILED",
+                    "sourcePath": source.path, "error": error.localizedDescription], options: [.prettyPrinted, .sortedKeys]) {
+                _ = try? SafeExport.writeReport(data, to: directory)
+            }
+            guard stillCurrent(item, operation: operation, snapshot: captured) else { return false }
+            item.state = .failed(error.localizedDescription)
+            lastMessageIsError = true
+            lastMessage = "GIF 导出未完成：\(error.localizedDescription)"
+            return false
+        }
+    }
+
+    func convertAndDeliver(_ item: QueueItem, to destination: Destination, revealOutput: Bool = true) async {
         guard !isClosing, !isBatchRunning else { return }
-        await deliver(item, to: destination)
+        await deliver(item, to: destination, revealOutput: revealOutput)
     }
 
     func convertAll(to destination: Destination) async {
@@ -354,7 +486,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func deliver(_ item: QueueItem, to destination: Destination) async {
+    private func deliver(_ item: QueueItem, to destination: Destination, revealOutput: Bool = true) async {
         guard item.canDeliver, let prepared = item.result,
               let expectedSourceHash = item.inputSHA256,
               let expectedImageHash = item.imageSHA256,
@@ -372,7 +504,9 @@ final class AppModel: ObservableObject {
         let parent = outputParent ?? item.url.deletingLastPathComponent()
         var destinationFolder: URL?
         var receipt = ConversionReceipt(source: item.url, sourceSHA256: expectedSourceHash,
-                                        settings: captured, result: prepared, expectedAudio: expectedAudio)
+                                        settings: captured, result: prepared, expectedAudio: expectedAudio,
+                                        sourceKind: item.isStillImage ? "still_image" : "video",
+                                        motionEffect: item.isStillImage ? "local_gentle_zoom_pan" : nil)
         do {
             let source = item.url
             let currentHash = try await Task.detached { try SafeExport.sha256(source) }.value
@@ -436,7 +570,7 @@ final class AppModel: ObservableObject {
                 item.state = .done
             }
             guard stillCurrent(item, operation: operation, snapshot: captured) else { return }
-            NSWorkspace.shared.activateFileViewerSelecting([pair.image, pair.mov])
+            if revealOutput { NSWorkspace.shared.activateFileViewerSelecting([pair.image, pair.mov]) }
         } catch {
             receipt.fail(error.localizedDescription)
             if let directory = destinationFolder {

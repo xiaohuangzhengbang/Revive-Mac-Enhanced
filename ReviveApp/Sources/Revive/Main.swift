@@ -162,10 +162,56 @@ enum Main {
                     exit(1)
                 }
                 print("UI smoke: actual JPG/MOV preview verified; human cover confirmation remains false")
+                if ProcessInfo.processInfo.environment["REVIVE_UI_SMOKE_GIF"] == "1" {
+                    guard item.isStillImage, item.url.lastPathComponent == "TEST_still_source.png",
+                          item.url.path.contains("/build/ci-evidence/StillMotion-Core-") else {
+                        print("UI smoke FAILED: GIF smoke requires the retained synthetic StillMotion core-test image")
+                        exit(1)
+                    }
+                    // Synthetic color/checker fixture contains no person. This
+                    // assertion is confined to the DEBUG terminal harness.
+                    item.coverConfirmed = true
+                    var gifFinished = false
+                    var gifExported = false
+                    Task { @MainActor in
+                        gifExported = await model.exportAnimatedGIF(item, revealOutput: false)
+                        gifFinished = true
+                    }
+                    let gifDeadline = Date().addingTimeInterval(30)
+                    while !gifFinished && Date() < gifDeadline {
+                        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                        host.layoutSubtreeIfNeeded()
+                    }
+                    guard gifFinished, gifExported, let gif = item.gifExportURL,
+                          FileManager.default.fileExists(atPath: gif.path),
+                          !item.checks.isEmpty, item.checks.allSatisfy({ $0.status == .pass }) else {
+                        print("UI smoke FAILED: image motion + GIF export did not pass")
+                        exit(1)
+                    }
+                    item.coverConfirmed = false
+                    print("UI smoke: image motion + GIF verified: \(gif.path); synthetic no-person confirmation used only by DEBUG harness and reset")
+                }
             }
             let deadline = Date().addingTimeInterval(3)
             while Date() < deadline {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                host.layoutSubtreeIfNeeded()
+            }
+            if ProcessInfo.processInfo.environment["REVIVE_UI_SMOKE_GIF"] == "1" {
+                // The hosted screen can be short. Show the actual image/GIF
+                // controls at the bottom without changing application layout.
+                func revealImageControls(_ view: NSView) {
+                    if let scroll = view as? NSScrollView, scroll.frame.width > 450,
+                       let document = scroll.documentView,
+                       document.bounds.height > scroll.contentView.bounds.height {
+                        let y = document.isFlipped
+                            ? max(0, document.bounds.height - scroll.contentView.bounds.height) : 0
+                        scroll.contentView.scroll(to: NSPoint(x: 0, y: y))
+                        scroll.reflectScrolledClipView(scroll.contentView)
+                    }
+                    for child in view.subviews { revealImageControls(child) }
+                }
+                revealImageControls(host)
                 host.layoutSubtreeIfNeeded()
             }
             if args.count > idx + 2 {
