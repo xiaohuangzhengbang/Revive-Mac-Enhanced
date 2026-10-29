@@ -470,6 +470,10 @@ enum LivePhotoEngine {
         private var fallbackTimer: DispatchSourceTimer?
         private var fallbackDrives = 0
 
+        // Like isFinished and the counters, this is read only by the owner
+        // queue. Keep the passive pre-recovery hot path to one ordinary load.
+        var hasFallbackDriven: Bool { fallbackDrives > 0 }
+
         init(label: String, group: DispatchGroup) {
             queue = DispatchQueue(label: label)
             self.group = group
@@ -895,10 +899,25 @@ enum LivePhotoEngine {
     /// callers leave this nil; no environment switch or global state can enable
     /// callback fault injection in a normal conversion.
     struct WriterProbe: Sendable {
+        /// Passive capture never invokes the callback/yield fault hooks. Until
+        /// recovery really runs it also avoids all per-buffer instrumentation.
+        let passiveNaturalCapture: Bool
         let allowsNativeCallback: @Sendable (String) -> Bool
         let yieldAfterAppend: @Sendable (String, String, AVAssetWriterInput) -> Bool
         let allowsFallback: @Sendable (String) -> Bool
         let observe: @Sendable (String, [String: Any]) -> Void
+
+        init(allowsNativeCallback: @escaping @Sendable (String) -> Bool,
+             yieldAfterAppend: @escaping @Sendable (String, String, AVAssetWriterInput) -> Bool,
+             allowsFallback: @escaping @Sendable (String) -> Bool,
+             observe: @escaping @Sendable (String, [String: Any]) -> Void,
+             passiveNaturalCapture: Bool = false) {
+            self.passiveNaturalCapture = passiveNaturalCapture
+            self.allowsNativeCallback = allowsNativeCallback
+            self.yieldAfterAppend = yieldAfterAppend
+            self.allowsFallback = allowsFallback
+            self.observe = observe
+        }
     }
 
     @discardableResult
@@ -1066,12 +1085,12 @@ enum LivePhotoEngine {
         let observePump: @Sendable (String, WritePump, AVAssetWriterInput, String, [String: Any]) -> Void = {
             name, pump, input, origin, extra in
             guard probe != nil else { return }
-            var fields = pump.snapshot(ready: input.isReadyForMoreMediaData)
+            var fields = pump.snapshot(ready: (extra["ready"] as? Bool) ?? input.isReadyForMoreMediaData)
             fields["mediaType"] = input.mediaType.rawValue
             fields["origin"] = origin
             observeWriter(name, fields.merging(extra) { _, current in current })
         }
-        observeWriter("writer.started", [:])
+        observeWriter("writer.started", ["passiveNaturalCapture": probe?.passiveNaturalCapture ?? false])
         let failure = FailureCoordinator(finishQueue: finishQueue, observe: trace.map { trace in
             { name, fields in trace.event(name, phase: "draining", fields: fields) }
         })
@@ -1165,7 +1184,9 @@ enum LivePhotoEngine {
                                                                "writerStatus": writer.status.rawValue])
                 metaPump.note("metadata appended", appendedPTS: stillTimeAbs.seconds)
                 completion.noteProgress()
-                observePump("append.success", metaPump, metaInput, origin, ["bufferSamples": 1])
+                if let probe, !probe.passiveNaturalCapture || metaPump.hasFallbackDriven {
+                    observePump("append.success", metaPump, metaInput, origin, ["bufferSamples": 1])
+                }
                 metaPump.finish {
                     if !failure.shouldStop, writer.status == .writing {
                         metaPump.note("markAsFinished entered")
@@ -1180,7 +1201,7 @@ enum LivePhotoEngine {
             metaPump.installFallbackDriver(shouldStop: { failure.shouldStop },
                 isReady: {
                     let ready = metaInput.isReadyForMoreMediaData
-                    observePump("pump.poll", metaPump, metaInput, "fallback", [:])
+                    observePump("pump.poll", metaPump, metaInput, "fallback", ["ready": ready])
                     return ready && (probe?.allowsFallback(metaInput.mediaType.rawValue) ?? true)
                 }, drive: { driveMetadata("fallback") },
                 onRecovery: {
@@ -1188,7 +1209,7 @@ enum LivePhotoEngine {
                     observePump("fallback.enter", metaPump, metaInput, "fallback", [:])
                 })
             metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
-                if let probe {
+                if let probe, !probe.passiveNaturalCapture {
                     guard !metaPump.isFinished, !failure.shouldStop,
                           probe.allowsNativeCallback(metaInput.mediaType.rawValue) else { return }
                 }
@@ -1227,9 +1248,12 @@ enum LivePhotoEngine {
                                                                  "writerStatus": writer.status.rawValue])
                             completion.noteProgress()
                             if let probe {
-                                observePump("append.success", pump, input, origin,
-                                            ["bufferSamples": CMSampleBufferGetNumSamples(sbuf)])
-                                if probe.yieldAfterAppend(input.mediaType.rawValue, origin, input) {
+                                if !probe.passiveNaturalCapture || pump.hasFallbackDriven {
+                                    observePump("append.success", pump, input, origin,
+                                                ["bufferSamples": CMSampleBufferGetNumSamples(sbuf)])
+                                }
+                                if !probe.passiveNaturalCapture,
+                                   probe.yieldAfterAppend(input.mediaType.rawValue, origin, input) {
                                     pump.note("controlled yield after append")
                                     observePump("driver.yielded", pump, input, origin, [:])
                                     return
@@ -1266,7 +1290,7 @@ enum LivePhotoEngine {
                 pump.installFallbackDriver(shouldStop: { failure.shouldStop },
                     isReady: {
                         let ready = input.isReadyForMoreMediaData
-                        observePump("pump.poll", pump, input, "fallback", [:])
+                        observePump("pump.poll", pump, input, "fallback", ["ready": ready])
                         return ready && (probe?.allowsFallback(input.mediaType.rawValue) ?? true)
                     }, drive: { driveMedia("fallback") },
                     onRecovery: {
@@ -1274,7 +1298,7 @@ enum LivePhotoEngine {
                         observePump("fallback.enter", pump, input, "fallback", [:])
                     })
                 input.requestMediaDataWhenReady(on: pump.queue) {
-                    if let probe {
+                    if let probe, !probe.passiveNaturalCapture {
                         guard !pump.isFinished, !failure.shouldStop,
                               probe.allowsNativeCallback(input.mediaType.rawValue) else { return }
                     }

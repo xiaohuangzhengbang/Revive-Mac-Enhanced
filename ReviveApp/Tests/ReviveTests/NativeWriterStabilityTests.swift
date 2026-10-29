@@ -133,6 +133,183 @@ final class NativeWriterStabilityTests: XCTestCase {
         try await exerciseNativeRecovery(mode: .negative, iteration: 1)
     }
 
+    /// This opt-in gate passes only after a spontaneous native stall is captured
+    /// and the original reader/writer actually recover through the normal timer.
+    /// Normal writes completing within the fixed budget are not recovery proof.
+    func testCapturesNaturalNativeStallAndVerifiesRecovery() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["REVIVE_NATURAL_CAPTURE"] == "1" else {
+            throw XCTSkip("Natural native capture is a separate explicit fixed-budget acceptance gate")
+        }
+        guard let budget = Int(environment["REVIVE_NATURAL_ITERATIONS"] ?? "500"),
+              (1...1000).contains(budget) else {
+            throw replayError("REVIVE_NATURAL_ITERATIONS must be an integer in 1...1000")
+        }
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_writer_stall_prepared",
+                                                    withExtension: "mov", subdirectory: "Fixtures"))
+        let originalHash = try SafeExport.sha256(source)
+        guard originalHash == "9dd43aa46f2a77c386999a3dd493c3811b32ed335c17cee860f0dd34c8c8e334" else {
+            throw replayError("Natural recovery capture must use the unchanged retained native stall fixture")
+        }
+        let videoBefore = try await compressedTracks(source, mediaType: .video)
+        let audioBefore = try await compressedTracks(source, mediaType: .audio)
+        let audioSamples = audioBefore.reduce(0) { $0 + $1.sampleCount }
+        let videoSamples = videoBefore.reduce(0) { $0 + $1.sampleCount }
+        guard audioSamples == 142, videoSamples == 91 else {
+            throw replayError("Natural recovery fixture sample counts changed")
+        }
+        let fallbackDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("build/ci-evidence", isDirectory: true)
+        let output = environment["REVIVE_NATURAL_OUTPUT_DIR"].flatMap { $0.isEmpty ? nil : $0 }
+            .map { URL(fileURLWithPath: $0, isDirectory: true) } ?? fallbackDirectory
+        try FileManager.default.createDirectory(at: output, withIntermediateDirectories: true)
+        let captureID = UUID().uuidString
+        var ledger: [[String: Any]] = []
+        var started = 0
+        var completed = 0
+        var observed = 0
+        var verified = 0
+        var totalNativeHookInvocations = 0
+        var totalYieldHookInvocations = 0
+        var currentArchitecture = "UNKNOWN"
+        var currentConfiguration = "UNKNOWN"
+
+        func writeSummary(_ status: String, extra: [String: Any] = [:]) throws {
+            var summary: [String: Any] = [
+                "status": status, "evidenceKind": NativeNaturalRecoveryProbe.evidenceKind,
+                "captureID": captureID, "sourceCommit": environment["GITHUB_SHA"] ?? "LOCAL_NOT_CI_BOUND",
+                "architecture": currentArchitecture, "configuration": currentConfiguration,
+                "attemptsBudget": budget, "attemptsStarted": started, "attemptsCompleted": completed,
+                "naturalStallsObserved": observed, "nativeRecoveriesVerified": verified,
+                "nativeCallbackHookInvocations": totalNativeHookInvocations,
+                "yieldHookInvocations": totalYieldHookInvocations,
+                "artificialFaultInjected": false, "perBufferInstrumentationBeforeFallback": false,
+                "productionNoProgressTimeoutSeconds": 120, "attemptDeadlineSeconds": 15,
+                "requiredGlobalNoProgressSeconds": 2, "requiredStableReadySnapshotSeconds": 1,
+                "sourceFixtureSHA256": originalHash, "expectedAudioSamples": audioSamples,
+                "expectedVideoSamples": videoSamples, "attempts": ledger,
+                "completedAtUtc": ISO8601DateFormatter().string(from: Date())
+            ]
+            for (key, value) in extra { summary[key] = value }
+            let path = output.appendingPathComponent(
+                "NaturalWriterRecovery-\(currentArchitecture)-\(currentConfiguration)-\(captureID).json")
+            let data = try JSONSerialization.data(withJSONObject: summary, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: path, options: .atomic)
+            print("NATURAL_WRITER_CAPTURE \(status) attempts=\(completed)/\(budget) receipt=\(path.path)")
+            fflush(stdout)
+        }
+
+        for iteration in 1...budget {
+            started += 1
+            let recorder = try NativeNaturalRecoveryProbe(expectedAudioSamples: audioSamples, directory: output)
+            currentArchitecture = recorder.architecture
+            currentConfiguration = recorder.configuration
+            let directory = output.appendingPathComponent("NaturalWriter-Pair-\(recorder.operationID)", isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+            let prepared = try await prepareReplayPair(source: source, directory: directory)
+            recorder.note("test.context", fields: ["iteration": iteration, "captureID": captureID,
+                "sourceFixtureSHA256": originalHash, "expectedAudioSamples": audioSamples,
+                "expectedVideoSamples": videoSamples, "assetID": prepared.assetID])
+            let attemptStarted = ProcessInfo.processInfo.systemUptime
+            let operation = Task {
+                try await LivePhotoEngine.passthroughWrite(asset: prepared.asset, to: prepared.movieURL,
+                    assetID: prepared.assetID, timeRange: nil, stillTimeAbs: prepared.actualTime,
+                    dropAudio: false, allowVideoReencode: false, probe: recorder.probe)
+            }
+            let deadline = Task {
+                do { try await Task.sleep(nanoseconds: 15_000_000_000) }
+                catch { return }
+                recorder.note("test.deadline.expired")
+                operation.cancel()
+            }
+            var hookCountsRecorded = false
+            var naturalStallCounted = false
+            func recordHookCounts() {
+                guard !hookCountsRecorded else { return }
+                let counts = recorder.hookInvocationCounts
+                totalNativeHookInvocations += counts.nativeCallback
+                totalYieldHookInvocations += counts.yield
+                hookCountsRecorded = true
+            }
+            do {
+                let copied = try await operation.value
+                deadline.cancel()
+                let integrityFailures = recorder.passiveIntegrityFailures()
+                guard integrityFailures.isEmpty else { throw replayError(integrityFailures.joined(separator: "; ")) }
+                let naturalStall = recorder.didObserveNaturalStall
+                if naturalStall {
+                    observed += 1
+                    naturalStallCounted = true
+                    let failures = recorder.recoveryValidationFailures()
+                    guard failures.isEmpty else { throw replayError(failures.joined(separator: "; ")) }
+                }
+                let checks = await Verifier.verify(imageURL: prepared.imageURL, movURL: prepared.movieURL,
+                    expectedDuration: prepared.duration, expectedStillTime: prepared.actualTime.seconds,
+                    expectedAudio: true)
+                let videoAfter = try await compressedTracks(prepared.movieURL, mediaType: .video)
+                let audioAfter = try await compressedTracks(prepared.movieURL, mediaType: .audio)
+                let videoPreserved = assertPreserved(videoBefore, videoAfter, mediaType: "natural-recovery video")
+                let audioPreserved = assertPreserved(audioBefore, audioAfter, mediaType: "natural-recovery audio")
+                let unchanged = try SafeExport.sha256(source) == originalHash
+                guard copied, !checks.isEmpty, checks.allSatisfy({ $0.status == .pass }),
+                      videoPreserved, audioPreserved, unchanged else {
+                    throw replayError("Native natural-capture output failed strict paired-file or compressed-sample validation")
+                }
+                let pair: [String: Any] = ["assetID": prepared.assetID,
+                    "sourceUnchanged": unchanged, "compressedVideoPreserved": videoPreserved,
+                    "compressedAudioPreserved": audioPreserved, "audioSamples": audioSamples,
+                    "videoSamples": videoSamples, "imageSHA256": try SafeExport.sha256(prepared.imageURL),
+                    "movieSHA256": try SafeExport.sha256(prepared.movieURL),
+                    "imageFile": directory.lastPathComponent + "/" + prepared.imageURL.lastPathComponent,
+                    "movieFile": directory.lastPathComponent + "/" + prepared.movieURL.lastPathComponent,
+                    "checks": checks.map { ["code": $0.code, "status": "pass", "detail": $0.detail] }]
+                recorder.note("test.files.verified", fields: pair)
+                if naturalStall {
+                    let failures = recorder.recoveryValidationFailures(requireFilesVerified: true)
+                    guard failures.isEmpty else { throw replayError(failures.joined(separator: "; ")) }
+                    verified += 1
+                }
+                completed += 1
+                let status = naturalStall ? "NATURE_RECOVERED" : "NORMAL_WRITE_COMPLETED_NO_STALL"
+                try recorder.finish(status: status, details: ["iteration": iteration, "captureID": captureID,
+                    "sourceFixtureSHA256": originalHash, "pairValidation": "STRICT_JPG_MOV_AND_COMPRESSED_PAYLOAD_PASS",
+                    "pair": pair])
+                recordHookCounts()
+                ledger.append(["iteration": iteration, "status": status,
+                    "elapsedSeconds": ProcessInfo.processInfo.systemUptime - attemptStarted,
+                    "receiptFile": recorder.receiptURL.lastPathComponent,
+                    "eventFile": recorder.eventURL.lastPathComponent])
+                if naturalStall {
+                    try writeSummary("NATURE_RECOVERED", extra: ["recoveredAttempt": iteration,
+                        "recoveryReceiptFile": recorder.receiptURL.lastPathComponent,
+                        "recoveryEventFile": recorder.eventURL.lastPathComponent, "pair": pair])
+                    return
+                }
+                try FileManager.default.removeItem(at: directory)
+            } catch {
+                deadline.cancel()
+                operation.cancel()
+                _ = await operation.result
+                let detail = error.localizedDescription
+                if recorder.didObserveNaturalStall && !naturalStallCounted { observed += 1 }
+                recordHookCounts()
+                try recorder.finish(status: "FAIL", details: ["iteration": iteration,
+                    "captureID": captureID, "error": detail,
+                    "sourceUnchanged": (try? SafeExport.sha256(source)) == originalHash,
+                    "retainedOutput": directory.lastPathComponent])
+                ledger.append(["iteration": iteration, "status": "FAIL", "error": detail,
+                    "receiptFile": recorder.receiptURL.lastPathComponent,
+                    "eventFile": recorder.eventURL.lastPathComponent])
+                try writeSummary("FAIL", extra: ["error": detail])
+                throw error
+            }
+        }
+        try writeSummary("NOT_OBSERVED", extra: [
+            "error": "Fixed budget exhausted without a naturally occurring native stall and verified fallback recovery"])
+        throw replayError("NATURAL_STALL_NOT_OBSERVED: \(budget) normal native writes are not recovery evidence")
+    }
+
     private func exerciseNativeRecovery(mode: NativeWriterRecoveryProbe.Mode, iteration: Int) async throws {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_writer_stall_prepared",
                                                     withExtension: "mov", subdirectory: "Fixtures"))

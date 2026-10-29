@@ -34,6 +34,8 @@ trap finish_receipt EXIT
 find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -name '*.mp4' -o -name '*.mov' \) -exec shasum -a 256 {} \; > "$OUT/source-sha256.txt"
 shasum -a 256 build.sh ci-*.py ci-*.sh >> "$OUT/source-sha256.txt"
 swift --version > "$OUT/SwiftVersion.txt"
+python3 ci-natural-recovery.py
+plutil -insert nativeNaturalStallRecovery -string VERIFIED "$PLIST"
 python3 ci-recovery-counterfactual.py
 plutil -insert recoveryCounterfactual -string EXPECTED_FAILURE_VERIFIED "$PLIST"
 swift test 2>&1 | tee "$OUT/NativeTests.log"
