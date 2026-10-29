@@ -11,6 +11,11 @@ private func tutorialError(_ message: String) -> NSError {
     NSError(domain: "ReviveRealTutorial", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
 }
 
+private func tutorialLog(_ message: String) {
+    print(message)
+    fflush(stdout)
+}
+
 @available(macOS 15.0, *)
 final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDelegate {
     private(set) var stream: SCStream?
@@ -23,15 +28,19 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
     private var failure: Error?
 
     func recordingOutputDidStartRecording(_ recordingOutput: SCRecordingOutput) {
+        tutorialLog("SCK delegate: recording started")
         lock.lock(); hasStarted = true; lock.unlock()
     }
     func recordingOutputDidFinishRecording(_ recordingOutput: SCRecordingOutput) {
+        tutorialLog("SCK delegate: recording finished")
         lock.lock(); hasFinished = true; lock.unlock()
     }
     func recordingOutput(_ recordingOutput: SCRecordingOutput, didFailWithError error: Error) {
+        tutorialLog("SCK delegate failure: \(error.localizedDescription)")
         lock.lock(); failure = error; lock.unlock()
     }
     func stream(_ stream: SCStream, didStopWithError error: Error) {
+        tutorialLog("SCK stream failure: \(error.localizedDescription)")
         lock.lock(); failure = error; lock.unlock()
     }
     private func state() -> (Bool, Bool, Error?) {
@@ -40,8 +49,10 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
     }
 
     func start(to url: URL) async throws {
-        print("Screen recording preflight: \(CGPreflightScreenCaptureAccess())")
+        tutorialLog("SCK preflight: \(CGPreflightScreenCaptureAccess()); bundle=\(Bundle.main.bundleIdentifier ?? "nil")")
+        tutorialLog("SCK awaiting shareable content")
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        tutorialLog("SCK shareable content: \(content.displays.count) displays; \(content.windows.count) windows")
         guard let display = content.displays.first else { throw tutorialError("No capturable desktop display") }
         let filter = SCContentFilter(display: display, excludingWindows: [])
         let configuration = SCStreamConfiguration()
@@ -60,7 +71,9 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
         try stream.addRecordingOutput(output)
         self.stream = stream; self.output = output
         self.filter = filter; self.configuration = configuration
+        tutorialLog("SCK startCapture: \(display.width)x\(display.height) -> \(url.lastPathComponent)")
         try await stream.startCapture()
+        tutorialLog("SCK startCapture returned; awaiting recording delegate")
         for _ in 0..<100 {
             let status = state()
             if let failure = status.2 { throw failure }
@@ -72,6 +85,7 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
 
     func screenshot(to url: URL) async throws {
         guard let filter, let configuration else { throw tutorialError("Recorder not configured") }
+        tutorialLog("SCK screenshot: \(url.lastPathComponent)")
         let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
         guard let target = CGImageDestinationCreateWithURL(url as CFURL, "public.png" as CFString, 1, nil) else {
             throw tutorialError("Cannot create native screenshot")
@@ -82,7 +96,9 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
 
     func stop() async throws -> Double {
         guard let stream, let output else { throw tutorialError("Recorder not running") }
+        tutorialLog("SCK stopCapture begin")
         try await stream.stopCapture()
+        tutorialLog("SCK stopCapture returned; awaiting file finalization")
         for _ in 0..<100 {
             let status = state()
             if let failure = status.2 { throw failure }
@@ -176,6 +192,7 @@ final class RealTutorial: ObservableObject {
     }
 
     func run() async {
+        tutorialLog("Tutorial run entered on main actor; windows=\(NSApp.windows.count)")
         guard !didRun else { return }; didRun = true
         do {
             let args = CommandLine.arguments
@@ -191,6 +208,14 @@ final class RealTutorial: ObservableObject {
             window.setContentSize(NSSize(width: max(900, min(1100, visible.width - 32)), height: max(620, min(900, visible.height - 52))))
             window.center(); window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
+            tutorialLog("Native window ready: visible=\(window.isVisible) frame=\(window.frame)")
+            if let host = window.contentView, let bitmap = host.bitmapImageRepForCachingDisplay(in: host.bounds) {
+                host.layoutSubtreeIfNeeded()
+                host.cacheDisplay(in: host.bounds, to: bitmap)
+                if let data = bitmap.representation(using: .png, properties: [:]) {
+                    try data.write(to: root.appendingPathComponent("LaunchWindow-DIAGNOSTIC.png"))
+                }
+            }
             let font = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Support/fonts/GreatVibes-Regular.ttf")
             CTFontManagerRegisterFontsForURL(font as CFURL, .process, nil)
             try await pause(2)
@@ -299,7 +324,17 @@ final class RealTutorial: ObservableObject {
         }
         let after = try SafeExport.sha256(source)
         guard before == after else { throw tutorialError("Original source changed") }
-        let result: [String: Any] = ["kind": kind, "sourceName": source.lastPathComponent, "sourceSHA256Before": before, "sourceSHA256After": after, "sourceUnchanged": true, "actualUIDelivery": true, "coverConfirmation": "automated UI checkbox; fox eye state requires separate visual review; no automated eye detection", "trimStart": item.trimStart, "trimEnd": item.trimEnd, "stillTime": item.result?.stillTime ?? -1, "liveFolder": kind + "/" + liveFolder.lastPathComponent, "imageSHA256": try SafeExport.sha256(image), "movieSHA256": try SafeExport.sha256(movie), "gifFile": gifPath, "checks": checks.map { ["code": $0.code, "status": $0.status.rawValue, "detail": $0.detail] }, "allStrictChecksPassed": true, "applePhotosLivePlaybackVerified": false]
+        var result: [String: Any] = ["kind": kind, "sourceName": source.lastPathComponent, "sourceSHA256Before": before, "sourceSHA256After": after, "sourceUnchanged": true, "actualUIDelivery": true, "coverConfirmation": "automated UI checkbox; fox eye state requires separate visual review; no automated eye detection", "trimStart": item.trimStart, "trimEnd": item.trimEnd, "stillTime": item.result?.stillTime ?? -1, "liveFolder": kind + "/" + liveFolder.lastPathComponent, "imageSHA256": try SafeExport.sha256(image), "movieSHA256": try SafeExport.sha256(movie), "gifFile": gifPath, "checks": checks.map { ["code": $0.code, "status": $0.status.rawValue, "detail": $0.detail] }, "allStrictChecksPassed": true, "applePhotosLivePlaybackVerified": false]
+        if kind == "photo" {
+            guard let motionSource = item.motionSourceURL else { throw tutorialError("Native still-motion intermediate missing") }
+            let motionCopy = caseRoot.appendingPathComponent("PHOTO_MOTION.MP4")
+            let motionHash = try SafeExport.sha256(motionSource)
+            try FileManager.default.copyItem(at: motionSource, to: motionCopy)
+            guard try SafeExport.sha256(motionCopy) == motionHash else { throw tutorialError("Native motion intermediate copy hash mismatch") }
+            result["nativeMotionFile"] = "photo/PHOTO_MOTION.MP4"
+            result["nativeMotionSHA256"] = motionHash
+            result["nativeMotionCopiedByteForByte"] = true
+        }
         try saveJSON(result, to: caseRoot.appendingPathComponent("CaseReceipt.json"))
         NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
         try await pause(1)
@@ -325,13 +360,36 @@ final class RealTutorial: ObservableObject {
 
 @available(macOS 15.0, *)
 @main
-struct RealTutorialApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ContentView()
-                .environmentObject(AppModel.shared)
-                .environmentObject(Localizer.shared)
-                .task { await RealTutorial.shared.run() }
+enum RealTutorialMain {
+    @MainActor static func main() {
+        setbuf(stdout, nil)
+        tutorialLog("Native tutorial main entered; pid=\(ProcessInfo.processInfo.processIdentifier)")
+        let app = NSApplication.shared
+        app.setActivationPolicy(.regular)
+        app.finishLaunching()
+        Localizer.shared.lang = .zhHans
+        let visible = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
+        let size = NSSize(width: max(900, min(1100, visible.width - 32)), height: max(620, min(900, visible.height - 52)))
+        let host = NSHostingView(rootView: ContentView()
+            .environmentObject(AppModel.shared)
+            .environmentObject(Localizer.shared))
+        host.frame = NSRect(origin: .zero, size: size)
+        let window = NSWindow(contentRect: host.frame, styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+        window.title = "Revive"
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        app.activate(ignoringOtherApps: true)
+        host.layoutSubtreeIfNeeded()
+        tutorialLog("Explicit NSApplication/NSHostingView window created: visible=\(window.isVisible), frame=\(window.frame)")
+        Task { @MainActor in
+            await RealTutorial.shared.run()
         }
+        tutorialLog("Entering NSApplication.run event loop")
+        // This lexical lifetime retains the actual window for the whole event
+        // loop, matching the previously verified --ui-smoke initialization.
+        withExtendedLifetime(window) { app.run() }
+        tutorialLog("NSApplication event loop returned")
     }
 }
