@@ -16,6 +16,10 @@ on:
         description: DEBUG scheduling experiment, metadata callback delay (0-250 ms)
         required: true
         default: '0'
+      engine_reference:
+        description: Optional exact historical engine commit for counterfactual diagnosis
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -48,6 +52,7 @@ jobs:
           REVIVE_STRESS_ITERATIONS: ${{ inputs.iterations }}
           REVIVE_STRESS_REUSE_ITEM: ${{ inputs.reuse_item && '1' || '0' }}
           REVIVE_WRITER_META_DELAY_MS: ${{ inputs.metadata_delay_ms }}
+          REVIVE_DIAGNOSTIC_ENGINE_REF: ${{ inputs.engine_reference }}
         run: python3 ReviveApp/ci-diagnose-writer.py
       - name: Preserve diagnostics even when the native process fails or hangs
         if: always()
