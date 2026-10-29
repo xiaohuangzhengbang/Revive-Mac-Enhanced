@@ -1,0 +1,42 @@
+name: Record real media cases and native operation tutorial
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  real-native-tutorial:
+    if: github.event.repository.private == false && github.ref == 'refs/heads/codex/mac-parity'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: apple-silicon
+          - runner: macos-15-intel
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - name: Check out exact recording harness and unchanged app sources
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Compile native UI, preserve originals, export real media and record continuous desktop
+        timeout-minutes: 10
+        shell: bash
+        run: bash ReviveApp/ci-real-tutorial.sh
+      - name: Retain actual recordings, originals, JPG/MOV, GIF and native receipts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Revive-real-tutorial-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ReviveApp/build/real-tutorial/result/
+            ReviveApp/build/real-tutorial/originals/
+            ReviveApp/build/real-tutorial/logs/
+          retention-days: 7
+          if-no-files-found: warn
+          compression-level: 0
