@@ -84,7 +84,13 @@ if kill -0 "$PID" 2>/dev/null; then
   screencapture -x "$OUT/logs/FailureDesktop.png" || true
   exit 1
 fi
-wait "$PID"
+native_status=0
+wait "$PID" || native_status=$?
+cat "$OUT/logs/NativeTutorial.log"
+if [[ $native_status -ne 0 ]]; then
+  echo "Native tutorial exited with status $native_status; inspect failure JSON and actual screen evidence." >&2
+  exit "$native_status"
+fi
 trap - EXIT
 grep -q 'REAL TUTORIAL PASSED' "$OUT/logs/NativeTutorial.log"
 [[ -s "$OUT/result/操作教程-原生连续录屏.mp4" ]]

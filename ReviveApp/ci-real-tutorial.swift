@@ -6,6 +6,7 @@ import AVFoundation
 import ScreenCaptureKit
 import CoreText
 import ImageIO
+import ApplicationServices
 
 private func tutorialError(_ message: String) -> NSError {
     NSError(domain: "ReviveRealTutorial", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
@@ -165,6 +166,7 @@ final class RealTutorial: ObservableObject {
     }
     private func press(_ key: String) async throws {
         let title = Localizer.shared.t(key)
+        var remoteDiagnostic: [String: Any] = [:]
         for _ in 0..<25 {
             let candidates = controls().filter { ax in
                 let role = ax.accessibilityRole()
@@ -180,10 +182,65 @@ final class RealTutorial: ObservableObject {
                 try await pause(0.5)
                 return
             }
+            // SwiftUI's virtual accessibility children need not formally adopt
+            // NSAccessibilityProtocol. Ask the system AX bridge off the main
+            // thread, so its request can be serviced by this app's main loop.
+            // AXPress still invokes the actual control; no model action is used.
+            let remote = await Task.detached(priority: .userInitiated) {
+                Self.remotePress(title: title)
+            }.value
+            remoteDiagnostic = remote
+            if remote["pressed"] as? Bool == true {
+                event("ui.press", title, additional: ["mechanism": "AXUIElementPerformAction AXPress on actual native UI", "localizationKey": key])
+                try await pause(0.5)
+                return
+            }
             try await pause(0.2)
         }
         try dumpAccessibility()
+        try saveJSON(remoteDiagnostic, to: root.appendingPathComponent("RemoteAccessibility.json"))
+        tutorialLog("Remote AX failure: \(remoteDiagnostic)")
         throw tutorialError("Could not find enabled actual UI control: \(title)")
+    }
+
+    private nonisolated static func remotePress(title: String) -> [String: Any] {
+        let app = AXUIElementCreateApplication(ProcessInfo.processInfo.processIdentifier)
+        AXUIElementSetMessagingTimeout(app, 2)
+        let enhanced = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let manual = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        func value(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
+            var result: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, key as CFString, &result) == .success else { return nil }
+            return result
+        }
+        var queue: [(AXUIElement, Int)] = [(app, 0)]
+        var index = 0
+        var rows: [[String: Any]] = []
+        while index < queue.count && index < 5000 {
+            let (element, depth) = queue[index]
+            index += 1
+            let role = value(element, kAXRoleAttribute) as? String ?? ""
+            let parts = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute, kAXValueAttribute]
+                .compactMap { value(element, $0) as? String }
+            let text = parts.joined(separator: " ")
+            let enabled = (value(element, kAXEnabledAttribute) as? NSNumber)?.boolValue ?? false
+            rows.append(["role": role, "text": text, "enabled": enabled, "depth": depth])
+            if (role == kAXButtonRole || role == kAXCheckBoxRole), enabled, text.contains(title) {
+                let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
+                return ["pressed": result == .success, "pressResult": result.rawValue,
+                        "enhancedResult": enhanced.rawValue, "manualResult": manual.rawValue,
+                        "matchedRole": role, "matchedText": text]
+            }
+            if depth < 32 {
+                for key in [kAXWindowsAttribute, kAXChildrenAttribute, kAXContentsAttribute] {
+                    if let children = value(element, key) as? [AXUIElement] {
+                        queue.append(contentsOf: children.map { ($0, depth + 1) })
+                    }
+                }
+            }
+        }
+        return ["pressed": false, "enhancedResult": enhanced.rawValue,
+                "manualResult": manual.rawValue, "searchedNodes": index, "nodes": rows]
     }
     private func waitUntil(_ description: String, seconds: Double = 100, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
