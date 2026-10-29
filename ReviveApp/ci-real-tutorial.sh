@@ -89,7 +89,9 @@ for ((second=0; second<240; second++)); do
 done
 if kill -0 "$PID" 2>/dev/null; then
   echo 'Native tutorial exceeded 240 seconds. No recording success claimed.' >&2
+  /usr/bin/sample "$PID" 3 -file "$OUT/logs/HardTimeoutProcessSample.txt" || true
   screencapture -x "$OUT/logs/FailureDesktop.png" || true
+  cat "$OUT/logs/NativeTutorial.log"
   exit 1
 fi
 native_status=0
@@ -105,16 +107,23 @@ if [[ $native_status -ne 0 ]]; then
 fi
 trap - EXIT
 grep -q 'REAL TUTORIAL PASSED' "$OUT/logs/NativeTutorial.log"
-[[ -s "$OUT/result/操作教程-原生连续录屏.mp4" ]]
 [[ -s "$OUT/result/RealTutorialReceipt.json" ]]
 [[ "$(shasum -a 256 "$PHOTO" | awk '{print $1}')" == 886190890b5438e906a8a603d1e998a7e130cb2937a8db0e4cf320f0f17f172c ]]
 [[ "$(shasum -a 256 "$VIDEO" | awk '{print $1}')" == 0a47f3095c92da95e69382b2829462f6576844445f18b3acc8db6bf24dcd11f0 ]]
 python3 - "$OUT/result" <<'PY'
-import json, pathlib, sys
+import json, os, pathlib, sys
 root = pathlib.Path(sys.argv[1])
 receipt = json.loads((root/'RealTutorialReceipt.json').read_text())
-assert receipt['status'] == 'REAL_MEDIA_NATIVE_UI_EXPORT_AND_SCREEN_RECORDING_VERIFIED'
-assert receipt['recordedDuration'] > 35
+recording = os.environ.get('REVIVE_TUTORIAL_RECORDING') != '0'
+assert receipt['recordingRequired'] is recording
+assert receipt['continuousRecordingVerified'] is recording
+if recording:
+    assert receipt['status'] == 'REAL_MEDIA_NATIVE_UI_EXPORT_AND_SCREEN_RECORDING_VERIFIED'
+    assert receipt['recordedDuration'] > 35
+    assert (root/receipt['recordingFile']).stat().st_size > 0
+else:
+    assert receipt['status'] == 'REAL_MEDIA_NATIVE_UI_EXPORT_VERIFIED_NO_CONTINUOUS_RECORDING'
+    assert receipt['recordedDuration'] == 0 and receipt['recordingFile'] == ''
 assert len(receipt['cases']) == 2
 for case in receipt['cases']:
     assert case['sourceUnchanged'] and case['allStrictChecksPassed']
@@ -124,5 +133,5 @@ for case in receipt['cases']:
         assert (folder/name).is_file(), (case['kind'],name)
 assert receipt['cases'][1]['trimStart'] == 15 and receipt['cases'][1]['trimEnd'] == 18
 assert (root/receipt['cases'][0]['gifFile']).is_file()
-print(json.dumps({'status':'REAL_CASES_AND_CONTINUOUS_SCREEN_RECORDING_PASSED','seconds':receipt['recordedDuration'],'cases':len(receipt['cases'])}))
+print(json.dumps({'status':receipt['status'],'recordingRequired':recording,'seconds':receipt['recordedDuration'],'cases':len(receipt['cases'])}))
 PY

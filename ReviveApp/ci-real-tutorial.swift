@@ -48,7 +48,7 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
         return (hasStarted, hasFinished, failure)
     }
 
-    func start(to url: URL) async throws {
+    func start(to url: URL?) async throws {
         tutorialLog("SCK preflight: \(CGPreflightScreenCaptureAccess()); bundle=\(Bundle.main.bundleIdentifier ?? "nil")")
         tutorialLog("SCK awaiting shareable content")
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -62,6 +62,11 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
         configuration.queueDepth = 5
         configuration.showsCursor = true
         configuration.capturesAudio = false
+        self.filter = filter; self.configuration = configuration
+        guard let url else {
+            tutorialLog("SCK screenshot-only mode: no SCStream or SCRecordingOutput encoding is active")
+            return
+        }
         let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
         let recording = SCRecordingOutputConfiguration()
         recording.outputURL = url
@@ -70,7 +75,6 @@ final class TutorialRecorder: NSObject, SCRecordingOutputDelegate, SCStreamDeleg
         let output = SCRecordingOutput(configuration: recording, delegate: self)
         try stream.addRecordingOutput(output)
         self.stream = stream; self.output = output
-        self.filter = filter; self.configuration = configuration
         tutorialLog("SCK startCapture: \(display.width)x\(display.height) -> \(url.lastPathComponent)")
         try await stream.startCapture()
         tutorialLog("SCK startCapture returned; awaiting recording delegate")
@@ -120,6 +124,11 @@ final class RealTutorial: ObservableObject {
     private var root: URL!
     private var window: NSWindow!
     private var model: AppModel { AppModel.shared }
+    private let recordingRequired = ProcessInfo.processInfo.environment["REVIVE_TUTORIAL_RECORDING"] != "0"
+    private var currentItem: QueueItem?
+    private var initialScratchNames = Set<String>()
+    private var scratchRoots: [String: URL] = [:]
+    private var waitSamples: [[String: Any]] = []
 
     private func pause(_ seconds: Double) async throws {
         try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
@@ -224,9 +233,39 @@ final class RealTutorial: ObservableObject {
             return ["pressed": false, "error": "Separate AX helper failed: \(error.localizedDescription)"]
         }
     }
-    private func waitUntil(_ description: String, seconds: Double = 100, _ condition: () -> Bool) async throws {
+    private func scratchSnapshot() -> [[String: Any]] {
+        let parent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+        let children = (try? FileManager.default.contentsOfDirectory(at: parent, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
+        for child in children where child.lastPathComponent.hasPrefix("Revive-") && !initialScratchNames.contains(child.lastPathComponent) {
+            if (try? child.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true {
+                scratchRoots[child.lastPathComponent] = child
+            }
+        }
+        var files: [[String: Any]] = []
+        for (name, directory) in scratchRoots {
+            guard let enumerator = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]) else { continue }
+            for case let file as URL in enumerator {
+                guard let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]), values.isRegularFile == true else { continue }
+                files.append(["path": name + "/" + String(file.path.dropFirst(directory.path.count + 1)), "bytes": values.fileSize ?? -1, "modified": values.contentModificationDate?.timeIntervalSince1970 ?? 0])
+            }
+        }
+        return files.sorted { ($0["path"] as! String) < ($1["path"] as! String) }
+    }
+
+    private func waitUntil(_ description: String, seconds: Double = 100, observeItem: QueueItem? = nil, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)
-        while !condition() && Date() < deadline { try await pause(0.1) }
+        var nextSample = Date()
+        while !condition() && Date() < deadline {
+            if let item = observeItem, Date() >= nextSample {
+                let sample: [String: Any] = ["seconds": Date().timeIntervalSince(started), "waitingFor": description, "mainActorHeartbeat": true, "state": String(describing: item.state), "previewReady": item.previewReady, "scratchFiles": scratchSnapshot()]
+                waitSamples.append(sample)
+                if let data = try? JSONSerialization.data(withJSONObject: sample, options: [.sortedKeys]), let text = String(data: data, encoding: .utf8) {
+                    tutorialLog("WAIT_DIAGNOSTIC " + text)
+                }
+                nextSample = Date().addingTimeInterval(1)
+            }
+            try await pause(0.1)
+        }
         guard condition() else { throw tutorialError("Timed out waiting for \(description)") }
     }
 
@@ -238,6 +277,8 @@ final class RealTutorial: ObservableObject {
             guard args.count == 4 else { throw tutorialError("Usage: RealTutorial <photo.jpg> <video.mp4> <new-output-folder>") }
             root = URL(fileURLWithPath: args[3], isDirectory: true)
             try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let scratchParent = FileManager.default.temporaryDirectory.resolvingSymlinksInPath()
+            initialScratchNames = Set(((try? FileManager.default.contentsOfDirectory(atPath: scratchParent.path)) ?? []).filter { $0.hasPrefix("Revive-") })
             Localizer.shared.lang = .zhHans
             NSApp.setActivationPolicy(.regular)
             try await pause(2)
@@ -258,9 +299,11 @@ final class RealTutorial: ObservableObject {
             let font = URL(fileURLWithPath: #filePath).deletingLastPathComponent().appendingPathComponent("Support/fonts/GreatVibes-Regular.ttf")
             CTFontManagerRegisterFontsForURL(font as CFURL, .process, nil)
             try await pause(2)
-            try await recorder.start(to: root.appendingPathComponent("操作教程-原生连续录屏.mp4"))
+            try await recorder.start(to: recordingRequired ? root.appendingPathComponent("操作教程-原生连续录屏.mp4") : nil)
             started = Date()
-            event("recording.start", "ScreenCaptureKit 实际桌面连续采集；与发布版本同源的 CI 自动操作，不是人工录制或界面模拟")
+            event(recordingRequired ? "recording.start" : "screenshots.ready", recordingRequired
+                ? "ScreenCaptureKit 实际桌面连续采集；与发布版本同源的 CI 自动操作，不是人工录制或界面模拟"
+                : "ScreenCaptureKit 实际截图模式；没有持续录制编码，仍通过实际界面完成全部转换和文件检查")
             try await pause(2)
             var results: [[String: Any]] = []
             for (kind, source) in [("photo", URL(fileURLWithPath: args[1])), ("video", URL(fileURLWithPath: args[2]))] {
@@ -268,20 +311,45 @@ final class RealTutorial: ObservableObject {
             }
             event("recording.finish", "两组案例导入、预览、实际封面确认、导出完成；原素材哈希未变")
             try await pause(2)
-            let recordedDuration = try await recorder.stop()
+            let recordedDuration: Double
+            if recordingRequired { recordedDuration = try await recorder.stop() }
+            else { recordedDuration = 0 }
             let report: [String: Any] = ["status": "REAL_MEDIA_NATIVE_UI_EXPORT_AND_SCREEN_RECORDING_VERIFIED", "sourceCommit": ProcessInfo.processInfo.environment["GITHUB_SHA"] ?? "LOCAL_UNRECORDED", "applicationSourceCommit": ProcessInfo.processInfo.environment["REVIVE_APP_SOURCE_COMMIT"] ?? "UNKNOWN", "buildConfiguration": "debug CI-only entry; unchanged production views models engine verifier", "recordingMethod": "ScreenCaptureKit continuous desktop capture H264 MP4", "uiActionsMethod": "actual native controls through NSAccessibility.accessibilityPerformPress", "importMethod": "AppModel.add, same original-file entry used by drag/drop and Open With; no manual file picker claimed", "humanOperated": false, "recordedDuration": recordedDuration, "applePhotosLivePlaybackVerified": false, "cases": results, "events": events]
             var finalReport = report
-            finalReport["recordingFile"] = "操作教程-原生连续录屏.mp4"
-            finalReport["captionsFile"] = "操作教程.zh-CN.vtt"
+            finalReport["status"] = recordingRequired ? "REAL_MEDIA_NATIVE_UI_EXPORT_AND_SCREEN_RECORDING_VERIFIED" : "REAL_MEDIA_NATIVE_UI_EXPORT_VERIFIED_NO_CONTINUOUS_RECORDING"
+            finalReport["recordingRequired"] = recordingRequired
+            finalReport["continuousRecordingVerified"] = recordingRequired
+            finalReport["recordingMethod"] = recordingRequired ? "ScreenCaptureKit continuous desktop capture H264 MP4" : "ScreenCaptureKit screenshots only; no SCStream/SCRecordingOutput encoding"
+            finalReport["recordingFile"] = recordingRequired ? "操作教程-原生连续录屏.mp4" : ""
+            finalReport["captionsFile"] = recordingRequired ? "操作教程.zh-CN.vtt" : ""
             try saveJSON(finalReport, to: root.appendingPathComponent("RealTutorialReceipt.json"))
-            try writeVTT(duration: recordedDuration)
+            try saveJSON(waitSamples, to: root.appendingPathComponent("WaitDiagnostics.json"))
+            if recordingRequired { try writeVTT(duration: recordedDuration) }
             print("REAL TUTORIAL PASSED")
             fflush(stdout)
             NSApp.terminate(nil)
         } catch {
             print("REAL TUTORIAL FAILED: \(error.localizedDescription)")
             if let root {
-                try? saveJSON(["status": "FAILED", "error": error.localizedDescription, "screenCapturePermissionPreflight": CGPreflightScreenCaptureAccess(), "events": events], to: root.appendingPathComponent("RealTutorialFailure.json"))
+                let failureState = currentItem.map { String(describing: $0.state) } ?? "no current queue item"
+                let files = scratchSnapshot()
+                try? await recorder.screenshot(to: root.appendingPathComponent("FailureScreen.png"))
+                var failureRecordingSeconds = 0.0
+                if recordingRequired, recorder.stream != nil { failureRecordingSeconds = (try? await recorder.stop()) ?? 0 }
+                try? saveJSON(["status": "FAILED", "error": error.localizedDescription, "screenCapturePermissionPreflight": CGPreflightScreenCaptureAccess(), "recordingRequired": recordingRequired, "failureRecordingSeconds": failureRecordingSeconds, "itemState": failureState, "scratchFiles": files, "events": events], to: root.appendingPathComponent("RealTutorialFailure.json"))
+                try? saveJSON(waitSamples, to: root.appendingPathComponent("WaitDiagnostics.json"))
+                let failureScratch = root.appendingPathComponent("FailureScratch", isDirectory: true)
+                try? FileManager.default.createDirectory(at: failureScratch, withIntermediateDirectories: false)
+                for (name, path) in scratchRoots { try? FileManager.default.copyItem(at: path, to: failureScratch.appendingPathComponent(name, isDirectory: true)) }
+                let sampleURL = root.appendingPathComponent("FailureProcessSample.txt")
+                await Task.detached {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: "/usr/bin/sample")
+                    process.arguments = [String(ProcessInfo.processInfo.processIdentifier), "3", "-file", sampleURL.path]
+                    process.standardOutput = FileHandle.standardError
+                    process.standardError = FileHandle.standardError
+                    do { try process.run(); process.waitUntilExit() } catch { tutorialLog("Failure sample unavailable: \(error.localizedDescription)") }
+                }.value
                 try? dumpAccessibility()
             }
             fflush(stdout)
@@ -298,6 +366,7 @@ final class RealTutorial: ObservableObject {
         NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
         model.add(urls: [source])
         guard let item = model.items.last else { throw tutorialError("Import produced no queue item") }
+        currentItem = item
         model.selectionID = item.id
         try await waitUntil("source loading", seconds: 30) { item.state != .loading }
         guard item.state == .ready else { throw tutorialError("Source load failed: \(item.state)") }
@@ -319,7 +388,7 @@ final class RealTutorial: ObservableObject {
         scrollEditor(bottom: true)
         try await pause(1)
         try await press("prepare_preview")
-        try await waitUntil("verified output preview") { item.previewReady || { if case .failed = item.state { return true }; return false }() }
+        try await waitUntil("verified output preview", observeItem: item) { item.previewReady || { if case .failed = item.state { return true }; return false }() }
         guard item.previewReady, item.coverImage != nil, !item.checks.isEmpty,
               item.checks.allSatisfy({ $0.status == .pass }) else { throw tutorialError("Actual JPG/MOV preview failed") }
         event("\(kind).preview.ready", "原生引擎已生成并严格复验实际 JPG/MOV；封面尚未确认")
@@ -378,6 +447,7 @@ final class RealTutorial: ObservableObject {
         NSApp.activate(ignoringOtherApps: true); window.makeKeyAndOrderFront(nil)
         try await pause(1)
         model.remove(item)
+        currentItem = nil
         try await pause(1)
         return result
     }

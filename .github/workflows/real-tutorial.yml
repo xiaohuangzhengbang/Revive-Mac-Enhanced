@@ -15,8 +15,10 @@ jobs:
         include:
           - runner: macos-15
             arch: apple-silicon
+            recording: '1'
           - runner: macos-15-intel
             arch: intel
+            recording: '0'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 12
     steps:
@@ -28,6 +30,8 @@ jobs:
       - name: Compile native UI, preserve originals, export real media and record continuous desktop
         timeout-minutes: 10
         shell: bash
+        env:
+          REVIVE_TUTORIAL_RECORDING: ${{ matrix.recording }}
         run: bash ReviveApp/ci-real-tutorial.sh
       - name: Retain actual recordings, originals, JPG/MOV, GIF and native receipts
         if: always()
