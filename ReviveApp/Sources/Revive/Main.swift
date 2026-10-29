@@ -102,7 +102,8 @@ enum Main {
 
         if let idx = args.firstIndex(of: "--ui-smoke") {
             let app = NSApplication.shared
-            app.setActivationPolicy(.prohibited)
+            app.setActivationPolicy(.regular)
+            app.finishLaunching()
             // dev-only: register the OFL brand font from the source tree so the
             // wordmark renders offscreen (the real app uses ATSApplicationFontsPath)
             let fontURL = URL(fileURLWithPath: #filePath)
@@ -120,7 +121,15 @@ enum Main {
             let host = NSHostingView(rootView: ContentView()
                 .environmentObject(model)
                 .environmentObject(Localizer.shared))
-            host.frame = NSRect(x: 0, y: 0, width: 1000, height: 700)
+            host.frame = NSRect(x: 0, y: 0, width: 1100, height: 900)
+            // AppKit lists, player surfaces and control enabled states need a
+            // real window. An unattached hosting view produces a partial image.
+            let window = NSWindow(contentRect: host.frame,
+                                  styleMask: [.titled, .closable, .resizable],
+                                  backing: .buffered, defer: false)
+            window.contentView = host
+            window.makeKeyAndOrderFront(nil)
+            app.activate(ignoringOtherApps: true)
             host.layoutSubtreeIfNeeded()
             if args.count > idx + 1 {
                 guard let item = model.items.first else {
