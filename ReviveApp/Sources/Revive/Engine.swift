@@ -590,8 +590,10 @@ enum LivePhotoEngine {
             if writer.status == .writing { writer.cancelWriting() }
         }
         writer.metadata = topLevelMetadata(assetID: assetID)
+        writer.movieTimeScale = 60_000
 
         var videoCopied = true
+        var markerFrameDuration = CMTime(value: 1, timescale: 30)
         var pairs: [(AVAssetReaderTrackOutput, AVAssetWriterInput)] = []
         let tracks = try await asset.load(.tracks)
         for track in tracks where track.mediaType == .video || (track.mediaType == .audio && !dropAudio) {
@@ -640,6 +642,15 @@ enum LivePhotoEngine {
             input.expectsMediaDataInRealTime = false
             if track.mediaType == .video {
                 input.transform = try await track.load(.preferredTransform)
+                let frameDuration = try await track.load(.minFrameDuration)
+                if frameDuration.isNumeric, frameDuration.seconds > 0 {
+                    markerFrameDuration = frameDuration
+                } else {
+                    let frameRate = try await track.load(.nominalFrameRate)
+                    if frameRate.isFinite, frameRate > 0 {
+                        markerFrameDuration = CMTime(seconds: 1 / Double(frameRate), preferredTimescale: 60_000)
+                    }
+                }
             }
             guard writer.canAdd(input) else { throw EngineError.cannotWrite("can't write \(track.mediaType.rawValue) track") }
             writer.add(input)
@@ -654,6 +665,16 @@ enum LivePhotoEngine {
         guard writer.canAdd(metaInput) else { throw EngineError.cannotWrite("can't add still-image-time metadata track") }
         writer.add(metaInput)
 
+        let markerEnd: CMTime
+        if let timeRange { markerEnd = timeRange.end }
+        else { markerEnd = try await asset.load(.duration) }
+        let remaining = CMTimeSubtract(markerEnd, stillTimeAbs)
+        guard remaining.isNumeric, remaining.seconds > 0 else {
+            throw EngineError.cannotWrite("still-image-time sample must be inside the movie")
+        }
+        // Give the marker the selected frame's interval, clipped at the end.
+        // A one-tick interval can round to an empty edit and disappear on read.
+        let markerDuration = CMTimeMinimum(markerFrameDuration, remaining)
         guard reader.startReading() else {
             throw EngineError.cannotRead(reader.error?.localizedDescription ?? "startReading failed")
         }
@@ -667,7 +688,7 @@ enum LivePhotoEngine {
             items: [item(keyStillImageTime, NSNumber(value: 0), "com.apple.metadata.datatype.int8")],
             timeRange: CMTimeRange(
                 start: stillTimeAbs,
-                duration: CMTime(value: 1, timescale: 60_000)
+                duration: markerDuration
             )
         )
 

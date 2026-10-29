@@ -143,6 +143,28 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(Set(leftovers), Set(["COVER.JPG", "COVER.MOV"]))
     }
 
+    func testLastCoverFrameHasReadableMarkerContainedInMovie() async throws {
+        let source = tmp.appendingPathComponent("last-frame.mp4")
+        try makeTestVideo(at: source)
+        let original = try Data(contentsOf: source)
+        var settings = ConversionSettings()
+        settings.exactTrim = true
+        settings.trimStart = 0.213
+        settings.trimEnd = 0.902
+        settings.frameTime = 0.688
+        let result = try await LivePhotoEngine.convert(input: source,
+            outputDir: tmp.appendingPathComponent("last-frame-pair"), baseName: "LAST", settings: settings)
+        let marker = try await stillMetadataRange(result.movURL)
+        XCTAssertEqual(marker.start.seconds, result.stillTime, accuracy: 0.001)
+        XCTAssertGreaterThan(marker.duration.seconds, 0)
+        XCTAssertLessThanOrEqual(marker.end.seconds, result.clipDuration + 0.0001)
+        let checks = await Verifier.verify(imageURL: result.imageURL, movURL: result.movURL,
+            expectedDuration: settings.trimEnd - settings.trimStart,
+            expectedStillTime: result.stillTime, expectedAudio: false)
+        for check in checks { XCTAssertEqual(check.status, .pass, "\(check.code): \(check.detail)") }
+        XCTAssertEqual(try Data(contentsOf: source), original)
+    }
+
     func testRejectsExistingImageOrMovieWithoutChangingFiles() async throws {
         let src = tmp.appendingPathComponent("source.mp4")
         try makeTestVideo(at: src)
