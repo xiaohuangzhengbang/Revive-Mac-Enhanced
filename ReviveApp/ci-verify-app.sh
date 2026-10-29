@@ -94,7 +94,7 @@ cd "$PROJECT_ROOT"
 swift build -c debug 2>&1 | tee "$EVIDENCE/DebugUIBuild.log"
 DEBUG_BIN="$(swift build -c debug --show-bin-path)/Revive"
 SNAPSHOT="$EVIDENCE/NativeUISmoke.png"
-REVIVE_LANG=en "$DEBUG_BIN" --ui-smoke \
+REVIVE_LANG=zh-Hans "$DEBUG_BIN" --ui-smoke \
   "$PROJECT_ROOT/Tests/ReviveTests/Fixtures/TEST_synthetic_six_seconds.mp4" \
   "$SNAPSHOT" > "$EVIDENCE/NativeUISmoke.log" 2>&1 &
 DEBUG_PID=$!
@@ -120,7 +120,7 @@ shopt -s nullglob
 image_fixtures=("$EVIDENCE"/StillMotion-Core-debug-*/TEST_still_source.png)
 [[ ${#image_fixtures[@]} -eq 1 ]] || { echo 'Expected one retained still-motion fixture.' >&2; exit 1; }
 IMAGE_SNAPSHOT="$EVIDENCE/NativeImageUISmoke.png"
-REVIVE_LANG=en REVIVE_UI_SMOKE_GIF=1 "$DEBUG_BIN" --ui-smoke \
+REVIVE_LANG=zh-Hans REVIVE_UI_SMOKE_GIF=1 "$DEBUG_BIN" --ui-smoke \
   "${image_fixtures[0]}" "$IMAGE_SNAPSHOT" > "$EVIDENCE/NativeImageUISmoke.log" 2>&1 &
 DEBUG_PID=$!
 for ((second = 0; second < 90; second++)); do

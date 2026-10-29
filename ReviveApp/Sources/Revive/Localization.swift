@@ -24,28 +24,22 @@ enum Lang: String, CaseIterable, Identifiable {
 final class Localizer: ObservableObject {
     static let shared = Localizer()
     private static let key = "revive.language"
+    private let defaults: UserDefaults
 
     @Published var lang: Lang {
-        didSet { UserDefaults.standard.set(lang.rawValue, forKey: Self.key) }
+        didSet { defaults.set(lang.rawValue, forKey: Self.key) }
     }
 
-    init() {
-        if let saved = UserDefaults.standard.string(forKey: Self.key),
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let saved = defaults.string(forKey: Self.key),
            let l = Lang(rawValue: saved) {
             lang = l
         } else {
-            let pref = Locale.preferredLanguages.first ?? "zh-Hant"
-            if pref.hasPrefix("zh-Hant") || pref.hasPrefix("zh-TW") || pref.hasPrefix("zh-HK") {
-                lang = .zhHant
-            } else if pref.hasPrefix("zh") {
-                lang = .zhHans
-            } else if pref.hasPrefix("es") {
-                lang = .es
-            } else if pref.hasPrefix("en") {
-                lang = .en
-            } else {
-                lang = .zhHant
-            }
+            // The Chinese edition starts in Simplified Chinese even when macOS
+            // uses English. Initial selection is not persisted; only a user's
+            // later language change is, so existing explicit preferences survive.
+            lang = .zhHans
         }
     }
 
@@ -59,7 +53,95 @@ final class Localizer: ObservableObject {
         String(format: t(key), arguments: args)
     }
 
+    /// Translate our diagnostic text only at the display boundary. Engine error
+    /// values remain unchanged for timeout classification and native receipts.
+    func engineDetail(_ detail: String) -> String {
+        if let key = Self.engineDetailKeys[detail] { return t(key) }
+        let prefixes = [
+            ("Output already exists: ", "engine_output_exists"),
+            ("Output directory components must be real directories: ", "engine_directory_component"),
+            ("still-image-time append failed: ", "engine_metadata_append"),
+            ("sample append failed: ", "engine_sample_append"),
+            ("Media writer made no progress for 120 seconds; ", "engine_timeout_details")
+        ]
+        for (prefix, key) in prefixes where detail.hasPrefix(prefix) {
+            return t(key, String(detail.dropFirst(prefix.count)))
+        }
+        let wrapped = [
+            ("still-image-time format description failed (OSStatus ", ")", "engine_metadata_format"),
+            ("Couldn't create ", " destination", "engine_image_destination"),
+            ("can't read ", " track", "engine_read_track"),
+            ("can't write ", " track", "engine_write_track")
+        ]
+        for (prefix, suffix, key) in wrapped where detail.hasPrefix(prefix) && detail.hasSuffix(suffix) {
+            let value = detail.dropFirst(prefix.count).dropLast(suffix.count)
+            return t(key, String(value))
+        }
+        // Native frameworks can return system-language text. Preserve it for
+        // diagnosis and explain that it is the original system detail.
+        return t("engine_system_detail", detail)
+    }
+
+    private static let engineDetailKeys: [String: String] = [
+        "Invalid local output name or directory": "engine_invalid_output",
+        "Trim times must be finite and within the source duration": "engine_trim_range",
+        "Trim end must be after trim start": "engine_trim_order",
+        "Cover time must be finite and before the clip end": "engine_cover_range",
+        "Cover time is outside the rendered video": "engine_cover_outside",
+        "Decoder returned an invalid cover frame time": "engine_cover_decode_time",
+        "Final movie does not contain the cover frame": "engine_movie_missing_cover",
+        "Output directory must be a real directory": "engine_output_directory",
+        "Invalid local directory": "engine_invalid_directory",
+        "Cannot determine output ownership": "engine_output_ownership",
+        "image encoding failed": "engine_image_encode",
+        "couldn't create export session": "engine_export_session",
+        "export failed": "engine_export_failed",
+        "Final movie would require another video encode": "engine_second_encode",
+        "can't add still-image-time metadata track": "engine_metadata_track",
+        "still-image-time sample must be inside the movie": "engine_metadata_time",
+        "startReading failed": "engine_start_read",
+        "startWriting failed": "engine_start_write",
+        "read failed": "engine_read_failed",
+        "writing failed": "engine_write_failed",
+        "writing did not complete": "engine_write_incomplete",
+        "Media writer made no progress for 120 seconds": "engine_timeout"
+    ]
+
     static let table: [String: [String: String]] = [
+        "import_panel_prompt": ["zh-Hant": "匯入", "zh-Hans": "导入", "en": "Import", "es": "Importar"],
+        "output_panel_prompt": ["zh-Hant": "選擇輸出位置", "zh-Hans": "选择输出位置", "en": "Choose Output Location", "es": "Elegir carpeta de salida"],
+        "engine_invalid_output": ["zh-Hant": "本機輸出名稱或目錄無效", "zh-Hans": "本地输出名称或目录无效", "en": "Invalid local output name or directory", "es": "Nombre o carpeta de salida local no válidos"],
+        "engine_trim_range": ["zh-Hant": "裁剪時間必須有效且位於原影片時長內", "zh-Hans": "裁剪时间必须有效且位于原视频时长内", "en": "Trim times must be finite and within the source duration", "es": "Los tiempos de recorte deben ser válidos y estar dentro del vídeo original"],
+        "engine_trim_order": ["zh-Hant": "裁剪結束時間必須晚於開始時間", "zh-Hans": "裁剪结束时间必须晚于开始时间", "en": "Trim end must be after trim start", "es": "El final del recorte debe ser posterior al inicio"],
+        "engine_cover_range": ["zh-Hant": "封面時間必須有效且早於片段結束時間", "zh-Hans": "封面时间必须有效且早于片段结束时间", "en": "Cover time must be finite and before the clip end", "es": "El tiempo de portada debe ser válido y anterior al final del clip"],
+        "engine_cover_outside": ["zh-Hant": "封面時間超出實際成片範圍", "zh-Hans": "封面时间超出实际成片范围", "en": "Cover time is outside the rendered video", "es": "El tiempo de portada está fuera del vídeo generado"],
+        "engine_cover_decode_time": ["zh-Hant": "解碼器傳回的封面影格時間無效", "zh-Hans": "解码器返回的封面帧时间无效", "en": "Decoder returned an invalid cover frame time", "es": "El decodificador devolvió un tiempo de portada no válido"],
+        "engine_movie_missing_cover": ["zh-Hant": "最終影片不包含所選封面影格", "zh-Hans": "最终视频不包含所选封面帧", "en": "Final movie does not contain the cover frame", "es": "El vídeo final no contiene el fotograma de portada"],
+        "engine_output_directory": ["zh-Hant": "輸出位置必須是真實目錄", "zh-Hans": "输出位置必须是真实目录", "en": "Output directory must be a real directory", "es": "La carpeta de salida debe ser un directorio real"],
+        "engine_invalid_directory": ["zh-Hant": "本機目錄無效", "zh-Hans": "本地目录无效", "en": "Invalid local directory", "es": "Directorio local no válido"],
+        "engine_output_ownership": ["zh-Hant": "無法確認輸出檔案身分", "zh-Hans": "无法确认输出文件身份", "en": "Cannot determine output ownership", "es": "No se puede identificar el archivo de salida"],
+        "engine_image_encode": ["zh-Hant": "封面圖片編碼失敗", "zh-Hans": "封面图片编码失败", "en": "image encoding failed", "es": "Falló la codificación de la imagen"],
+        "engine_export_session": ["zh-Hant": "無法建立影片匯出工作", "zh-Hans": "无法创建视频导出任务", "en": "couldn't create export session", "es": "No se pudo crear la sesión de exportación"],
+        "engine_export_failed": ["zh-Hant": "影片匯出失敗", "zh-Hans": "视频导出失败", "en": "export failed", "es": "Falló la exportación"],
+        "engine_second_encode": ["zh-Hant": "最終影片需要再次編碼，已停止以保持封面一致", "zh-Hans": "最终视频需要再次编码，已停止以保持封面一致", "en": "Final movie would require another video encode", "es": "El vídeo final requeriría otra codificación"],
+        "engine_metadata_track": ["zh-Hant": "無法加入實況時間中繼資料軌", "zh-Hans": "无法加入实况时间元数据轨", "en": "can't add still-image-time metadata track", "es": "No se puede añadir la pista de metadatos still-image-time"],
+        "engine_metadata_time": ["zh-Hant": "實況時間標記必須位於影片範圍內", "zh-Hans": "实况时间标记必须位于视频范围内", "en": "still-image-time sample must be inside the movie", "es": "La muestra still-image-time debe estar dentro del vídeo"],
+        "engine_start_read": ["zh-Hant": "無法開始讀取影片", "zh-Hans": "无法开始读取视频", "en": "startReading failed", "es": "No se pudo iniciar la lectura"],
+        "engine_start_write": ["zh-Hant": "無法開始寫入影片", "zh-Hans": "无法开始写入视频", "en": "startWriting failed", "es": "No se pudo iniciar la escritura"],
+        "engine_read_failed": ["zh-Hant": "影片讀取失敗", "zh-Hans": "视频读取失败", "en": "read failed", "es": "Falló la lectura"],
+        "engine_write_failed": ["zh-Hant": "影片寫入失敗", "zh-Hans": "视频写入失败", "en": "writing failed", "es": "Falló la escritura"],
+        "engine_write_incomplete": ["zh-Hant": "影片寫入未完成", "zh-Hans": "视频写入未完成", "en": "writing did not complete", "es": "La escritura no se completó"],
+        "engine_timeout": ["zh-Hant": "影片寫入已連續 120 秒沒有進展", "zh-Hans": "视频写入已连续 120 秒没有进展", "en": "Media writer made no progress for 120 seconds", "es": "La escritura del vídeo no avanzó durante 120 segundos"],
+        "engine_output_exists": ["zh-Hant": "輸出檔案已存在：%@", "zh-Hans": "输出文件已存在：%@", "en": "Output already exists: %@", "es": "El archivo de salida ya existe: %@"],
+        "engine_directory_component": ["zh-Hant": "輸出路徑必須由真實目錄組成：%@", "zh-Hans": "输出路径必须由真实目录组成：%@", "en": "Output directory components must be real directories: %@", "es": "La ruta de salida debe usar directorios reales: %@"],
+        "engine_metadata_append": ["zh-Hant": "實況時間標記寫入失敗；系統原始詳情：%@", "zh-Hans": "实况时间标记写入失败；系统原始详情：%@", "en": "still-image-time append failed: %@", "es": "Falló la escritura de still-image-time; detalle original: %@"],
+        "engine_sample_append": ["zh-Hant": "媒體資料寫入失敗；系統原始詳情：%@", "zh-Hans": "媒体数据写入失败；系统原始详情：%@", "en": "sample append failed: %@", "es": "Falló la escritura de la muestra; detalle original: %@"],
+        "engine_timeout_details": ["zh-Hant": "影片寫入已連續 120 秒沒有進展；診斷詳情：%@", "zh-Hans": "视频写入已连续 120 秒没有进展；诊断详情：%@", "en": "Media writer made no progress for 120 seconds; %@", "es": "La escritura del vídeo no avanzó durante 120 segundos; diagnóstico: %@"],
+        "engine_metadata_format": ["zh-Hant": "實況時間中繼資料格式建立失敗（OSStatus %@）", "zh-Hans": "实况时间元数据格式创建失败（OSStatus %@）", "en": "still-image-time format description failed (OSStatus %@)", "es": "Falló la creación del formato still-image-time (OSStatus %@)"],
+        "engine_image_destination": ["zh-Hant": "無法建立 %@ 封面輸出", "zh-Hans": "无法创建 %@ 封面输出", "en": "Couldn't create %@ destination", "es": "No se pudo crear el destino %@"],
+        "engine_read_track": ["zh-Hant": "無法讀取 %@ 媒體軌", "zh-Hans": "无法读取 %@ 媒体轨", "en": "can't read %@ track", "es": "No se puede leer la pista %@"],
+        "engine_write_track": ["zh-Hant": "無法寫入 %@ 媒體軌", "zh-Hans": "无法写入 %@ 媒体轨", "en": "can't write %@ track", "es": "No se puede escribir la pista %@"],
+        "engine_system_detail": ["zh-Hant": "系統原始詳情：%@", "zh-Hans": "系统原始详情：%@", "en": "%@", "es": "Detalle original del sistema: %@"],
         "image_motion_short": ["zh-Hant": "圖片運鏡", "zh-Hans": "图片运镜", "en": "PHOTO MOTION", "es": "MOVIMIENTO"],
         "image_motion_note": ["zh-Hant": "靜態圖片會產生 3 秒輕微縮放與平移；這是本機運鏡，不會生成人物動作。", "zh-Hans": "静态图片默认生成 3 秒轻微缩放与平移；这是本地运镜，不会生成人物动作。", "en": "Images become a 3-second gentle zoom-and-pan. This is local camera motion, not generated person movement.", "es": "Las imágenes usan zoom y desplazamiento suaves de 3 segundos; no se generan movimientos de personas."],
         "image_motion_rendering": ["zh-Hant": "正在產生圖片運鏡…", "zh-Hans": "正在生成图片运镜…", "en": "Rendering image motion…", "es": "Creando movimiento de imagen…"],

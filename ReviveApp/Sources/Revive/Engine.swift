@@ -17,7 +17,7 @@ enum EngineError: LocalizedError {
     var errorDescription: String? {
         let L = Localizer.shared
         func join(_ key: String, _ detail: String) -> String {
-            detail.isEmpty ? L.t(key) : "\(L.t(key)): \(detail)"
+            detail.isEmpty ? L.t(key) : "\(L.t(key)): \(L.engineDetail(detail))"
         }
         switch self {
         case .noVideoTrack: return L.t("err_no_video")

@@ -265,6 +265,8 @@ final class AppModel: ObservableObject {
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.allowedContentTypes = [.mpeg4Movie, .quickTimeMovie, .movie, .jpeg, .png, .heic, .heif]
+        panel.title = Localizer.shared.t("add_video")
+        panel.prompt = Localizer.shared.t("import_panel_prompt")
         if panel.runModal() == .OK { add(urls: panel.urls) }
     }
 
@@ -274,7 +276,8 @@ final class AppModel: ObservableObject {
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
-        panel.prompt = "选择输出位置"
+        panel.title = Localizer.shared.t("output_parent")
+        panel.prompt = Localizer.shared.t("output_panel_prompt")
         if panel.runModal() == .OK { outputParent = panel.url }
     }
 

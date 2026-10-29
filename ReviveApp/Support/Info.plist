@@ -5,7 +5,7 @@
 	<key>CFBundleName</key>
 	<string>Revive</string>
 	<key>CFBundleDisplayName</key>
-	<string>Revive Enhanced</string>
+	<string>Revive 增强版</string>
 	<key>CFBundleIdentifier</key>
 	<string>local.revive.enhanced</string>
 	<key>CFBundleExecutable</key>
@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.2.0</string>
+	<string>1.2.1</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSHighResolutionCapable</key>
@@ -31,7 +31,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Revive 會把轉換完成的原況照片(Live Photo)加入你的照片圖庫。</string>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>zh_TW</string>
+	<string>zh_CN</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
