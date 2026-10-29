@@ -1,0 +1,54 @@
+name: Diagnose native MOV writer stability
+
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Fixed preview iteration budget (1-1000, stop on first failure)
+        required: true
+        default: '40'
+      reuse_item:
+        description: Reuse the same model and queue item
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: writer-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  writer:
+    if: github.event.repository.private == false
+    name: Native writer diagnostic (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: intel
+          - runner: macos-15
+            arch: apple-silicon
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 25
+    steps:
+      - name: Check out the diagnostic commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Run fixed-budget native preview experiment with external stack sampling
+        env:
+          REVIVE_STRESS_ITERATIONS: ${{ inputs.iterations }}
+          REVIVE_STRESS_REUSE_ITEM: ${{ inputs.reuse_item && '1' || '0' }}
+        run: python3 ReviveApp/ci-diagnose-writer.py
+      - name: Preserve diagnostics even when the native process fails or hangs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: Writer-Diagnostic-${{ matrix.arch }}-${{ github.sha }}-${{ github.run_id }}
+          path: ReviveApp/build/writer-diagnostics/
+          if-no-files-found: error
+          retention-days: 14
