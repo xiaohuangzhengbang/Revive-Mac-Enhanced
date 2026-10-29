@@ -56,7 +56,7 @@ final class ModelParityTests: XCTestCase {
         item.trimEnd = 4.11
         item.frameTime = 1.49
         let prepared = await model.convert(item)
-        XCTAssertTrue(prepared)
+        XCTAssertTrue(prepared, "Actual preview conversion failed: \(item.state); checks: \(item.checks)")
         defer { item.invalidatePreview() }
         XCTAssertTrue(item.previewReady)
         XCTAssertNotNil(item.coverImage)

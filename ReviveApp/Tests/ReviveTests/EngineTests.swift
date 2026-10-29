@@ -245,6 +245,108 @@ final class EngineTests: XCTestCase {
         }
     }
 
+    func testWriteFailureDrainsNeverReadyPumpAndPreservesFirstError() async {
+        let finishQueue = DispatchQueue(label: "test.write.failure.finish")
+        let group = DispatchGroup()
+        let video = LivePhotoEngine.WritePump(label: "test.write.failure.video", group: group)
+        // This input never invokes a readiness callback. Stopping must not wait
+        // for AVFoundation to make it ready after another input has failed.
+        let neverReady = LivePhotoEngine.WritePump(label: "test.write.failure.never-ready", group: group)
+        let coordinator = LivePhotoEngine.FailureCoordinator(finishQueue: finishQueue)
+        let stopped = expectation(description: "failure completed after both queues drained")
+        let drained = expectation(description: "all input group entries left")
+        var failureCount = 0
+        let first = NSError(domain: "first-append", code: 17)
+        coordinator.activate(pumps: [video, neverReady]) { error in
+            failureCount += 1
+            XCTAssertEqual((error as NSError).domain, first.domain)
+            XCTAssertEqual((error as NSError).code, first.code)
+            stopped.fulfill()
+        }
+        group.notify(queue: finishQueue) { drained.fulfill() }
+        video.queue.async {
+            coordinator.fail(first)
+            coordinator.fail(NSError(domain: "later-timeout", code: 120))
+        }
+        await fulfillment(of: [stopped, drained], timeout: 2)
+        XCTAssertTrue(video.queue.sync { video.isFinished })
+        XCTAssertTrue(neverReady.queue.sync { neverReady.isFinished })
+        XCTAssertEqual(finishQueue.sync { failureCount }, 1)
+        XCTAssertFalse(coordinator.finishSuccessfully { XCTFail("A failed writer cannot succeed") })
+    }
+
+    func testWriteCancellationBeforeSetupWaitsForEveryPump() async {
+        let finishQueue = DispatchQueue(label: "test.write.pre-setup.finish")
+        let coordinator = LivePhotoEngine.FailureCoordinator(finishQueue: finishQueue)
+        coordinator.fail(EngineError.cancelled)
+        XCTAssertTrue(coordinator.shouldStop)
+        let group = DispatchGroup()
+        let first = LivePhotoEngine.WritePump(label: "test.write.pre-setup.first", group: group)
+        let last = LivePhotoEngine.WritePump(label: "test.write.pre-setup.last", group: group)
+        let stopped = expectation(description: "pre-setup cancellation completed")
+        let drained = expectation(description: "complete setup was drained")
+        var failureCount = 0
+        coordinator.activate(pumps: [first, last]) { error in
+            failureCount += 1
+            guard case EngineError.cancelled = error else {
+                XCTFail("The original cancellation must be preserved"); stopped.fulfill(); return
+            }
+            stopped.fulfill()
+        }
+        group.notify(queue: finishQueue) { drained.fulfill() }
+        coordinator.fail(NSError(domain: "later-append", code: 1))
+        await fulfillment(of: [stopped, drained], timeout: 2)
+        XCTAssertTrue(first.queue.sync { first.isFinished })
+        XCTAssertTrue(last.queue.sync { last.isFinished })
+        XCTAssertEqual(finishQueue.sync { failureCount }, 1)
+    }
+
+    func testWriteCancellationDuringEOFLeavesEachPumpOnce() async {
+        let finishQueue = DispatchQueue(label: "test.write.eof.finish")
+        let group = DispatchGroup()
+        let eof = LivePhotoEngine.WritePump(label: "test.write.eof.input", group: group)
+        let neverReady = LivePhotoEngine.WritePump(label: "test.write.eof.never-ready", group: group)
+        let coordinator = LivePhotoEngine.FailureCoordinator(finishQueue: finishQueue)
+        let stopped = expectation(description: "EOF cancellation completed")
+        let drained = expectation(description: "EOF and stop share one group leave")
+        var failureCount = 0
+        coordinator.activate(pumps: [eof, neverReady]) { _ in
+            failureCount += 1
+            stopped.fulfill()
+        }
+        group.notify(queue: finishQueue) {
+            XCTAssertFalse(coordinator.finishSuccessfully { XCTFail("Cancellation won before EOF left") })
+            drained.fulfill()
+        }
+        eof.queue.async {
+            eof.finish {
+                // Stop is requested while EOF completion is still on the input
+                // queue. Its queued stop must not leave this input a second time.
+                coordinator.fail(EngineError.cancelled)
+            }
+        }
+        await fulfillment(of: [stopped, drained], timeout: 2)
+        XCTAssertEqual(finishQueue.sync { failureCount }, 1)
+    }
+
+    func testWriteSuccessfulFinishRejectsLateCancellation() async {
+        let finishQueue = DispatchQueue(label: "test.write.success.finish")
+        let coordinator = LivePhotoEngine.FailureCoordinator(finishQueue: finishQueue)
+        let finished = expectation(description: "successful completion wins once")
+        var failureCount = 0
+        var successCount = 0
+        coordinator.activate(pumps: []) { _ in failureCount += 1 }
+        finishQueue.async {
+            XCTAssertTrue(coordinator.finishSuccessfully { successCount += 1 })
+            coordinator.fail(EngineError.cancelled)
+            XCTAssertFalse(coordinator.finishSuccessfully { successCount += 1 })
+            finished.fulfill()
+        }
+        await fulfillment(of: [finished], timeout: 2)
+        XCTAssertEqual(finishQueue.sync { successCount }, 1)
+        XCTAssertEqual(finishQueue.sync { failureCount }, 0)
+    }
+
     func testCancellationLeavesSourceAndNoPair() async throws {
         let src = tmp.appendingPathComponent("source.mp4")
         try makeTestVideo(at: src)

@@ -352,6 +352,102 @@ enum LivePhotoEngine {
         try? FileManager.default.removeItem(at: url)
     }
 
+    /// All accesses, including forced stop, stay on this input's serial queue.
+    /// A failed writer may never invoke another readiness callback.
+    final class WritePump: @unchecked Sendable {
+        let queue: DispatchQueue
+        private let group: DispatchGroup
+        private(set) var isFinished = false
+
+        init(label: String, group: DispatchGroup) {
+            queue = DispatchQueue(label: label)
+            self.group = group
+            group.enter()
+        }
+
+        func finish(_ beforeLeave: () -> Void = {}) {
+            dispatchPrecondition(condition: .onQueue(queue))
+            guard !isFinished else { return }
+            isFinished = true
+            beforeLeave()
+            group.leave()
+        }
+    }
+
+    /// Preserve the first failure and drain every input before native teardown.
+    /// Setup may still be registering callbacks when cancellation first arrives.
+    final class FailureCoordinator: @unchecked Sendable {
+        private let lock = NSLock()
+        private let finishQueue: DispatchQueue
+        private var firstError: Error?
+        private var setupReady = false
+        private var stopScheduled = false
+        private var didFinish = false
+        private var pumps: [WritePump] = []
+        private var onFailure: ((Error) -> Void)?
+
+        init(finishQueue: DispatchQueue) { self.finishQueue = finishQueue }
+
+        var shouldStop: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return firstError != nil || didFinish
+        }
+
+        func fail(_ error: Error) {
+            lock.lock()
+            guard !didFinish else { lock.unlock(); return }
+            if firstError == nil { firstError = error }
+            let stop = stopWorkIfReady()
+            lock.unlock()
+            stop?()
+        }
+
+        func activate(pumps: [WritePump], onFailure: @escaping (Error) -> Void) {
+            lock.lock()
+            guard !setupReady else { lock.unlock(); return }
+            self.pumps = pumps
+            self.onFailure = onFailure
+            setupReady = true
+            let stop = stopWorkIfReady()
+            lock.unlock()
+            stop?()
+        }
+
+        @discardableResult
+        func finishSuccessfully(_ finish: () -> Void) -> Bool {
+            lock.lock()
+            guard setupReady, firstError == nil, !didFinish else { lock.unlock(); return false }
+            didFinish = true
+            pumps = []
+            onFailure = nil
+            lock.unlock()
+            finish()
+            return true
+        }
+
+        // Called under lock; invoke the returned work only after unlocking.
+        private func stopWorkIfReady() -> (() -> Void)? {
+            guard setupReady, !stopScheduled, let error = firstError,
+                  let onFailure else { return nil }
+            stopScheduled = true
+            let pending = pumps
+            let finishQueue = finishQueue
+            pumps = []
+            self.onFailure = nil
+            return {
+                let drained = DispatchGroup()
+                for pump in pending {
+                    drained.enter()
+                    pump.queue.async {
+                        pump.finish()
+                        drained.leave()
+                    }
+                }
+                drained.notify(queue: finishQueue) { onFailure(error) }
+            }
+        }
+    }
+
     /// AVFoundation callbacks may stop arriving after cancellation or failure.
     /// Resume the awaiting task exactly once, independently of dispatch groups.
     private final class WriteCompletion: @unchecked Sendable {
@@ -694,16 +790,20 @@ enum LivePhotoEngine {
 
         let completion = WriteCompletion()
         let finishQueue = DispatchQueue(label: "revive.finish")
+        let failure = FailureCoordinator(finishQueue: finishQueue)
         try await withTaskCancellationHandler {
           try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "revive.watchdog"))
             watchdog.schedule(deadline: .now() + 5, repeating: 5)
             watchdog.setEventHandler {
                 finishQueue.async {
-                    guard completion.hasStalled else { return }
-                    completion.finish(.failure(EngineError.cannotWrite("Media writer made no progress for 120 seconds"))) {
-                        reader.cancelReading()
-                        writer.cancelWriting()
+                    guard !failure.shouldStop else { return }
+                    if reader.status == .failed {
+                        failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
+                    } else if writer.status == .failed {
+                        failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
+                    } else if completion.hasStalled {
+                        failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds"))
                     }
                 }
             }
@@ -711,70 +811,82 @@ enum LivePhotoEngine {
             watchdog.resume()
             guard completion.begin(cont, timer: watchdog) else { return }
             let group = DispatchGroup()
-            let errorLock = NSLock()
-            var firstError: Error?
-            func recordError(_ e: Error) {
-                errorLock.lock(); if firstError == nil { firstError = e }; errorLock.unlock()
-            }
-
-            group.enter()
-            let metaQueue = DispatchQueue(label: "revive.meta")
-            var metaDone = false
-            metaInput.requestMediaDataWhenReady(on: metaQueue) {
-                guard !metaDone, metaInput.isReadyForMoreMediaData else { return }
-                metaDone = true
+            // Enter every input before any callback can fail or finish. Forced
+            // stop runs on these same queues, even for inputs never made ready.
+            let metaPump = WritePump(label: "revive.meta", group: group)
+            let mediaPumps = pairs.indices.map { WritePump(label: "revive.pump.\($0)", group: group) }
+            let pumps = [metaPump] + mediaPumps
+            metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
+                guard !metaPump.isFinished, !failure.shouldStop,
+                      metaInput.isReadyForMoreMediaData else { return }
                 if !adaptor.append(stillGroup) {
-                    recordError(EngineError.cannotWrite(
+                    failure.fail(EngineError.cannotWrite(
                         "still-image-time append failed: \(writer.error?.localizedDescription ?? "?")"))
+                    return
                 }
                 completion.noteProgress()
-                metaInput.markAsFinished()
-                group.leave()
+                metaPump.finish {
+                    if !failure.shouldStop, writer.status == .writing { metaInput.markAsFinished() }
+                }
             }
 
             for (index, (output, input)) in pairs.enumerated() {
-                group.enter()
-                let queue = DispatchQueue(label: "revive.pump.\(index)")
-                var done = false
-                input.requestMediaDataWhenReady(on: queue) {
-                    guard !done else { return }
+                let pump = mediaPumps[index]
+                input.requestMediaDataWhenReady(on: pump.queue) {
+                    guard !pump.isFinished, !failure.shouldStop else { return }
                     while input.isReadyForMoreMediaData {
+                        guard !failure.shouldStop else { return }
                         if let sbuf = output.copyNextSampleBuffer() {
+                            guard !failure.shouldStop else { return }
                             if !input.append(sbuf) {
-                                recordError(EngineError.cannotWrite(
+                                failure.fail(EngineError.cannotWrite(
                                     "sample append failed: \(writer.error?.localizedDescription ?? "?")"))
-                                done = true; input.markAsFinished(); group.leave(); return
+                                return
                             }
                             completion.noteProgress()
                         } else {
-                            done = true; input.markAsFinished(); group.leave(); return
+                            if reader.status == .failed {
+                                failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
+                                return
+                            }
+                            pump.finish {
+                                if !failure.shouldStop, writer.status == .writing { input.markAsFinished() }
+                            }
+                            return
                         }
                     }
                 }
             }
 
+            failure.activate(pumps: pumps) { error in
+                // All input queues have drained; no copy, append or normal EOF
+                // marker can overlap native cancellation or output cleanup.
+                if reader.status == .reading { reader.cancelReading() }
+                if writer.status == .writing { writer.cancelWriting() }
+                completion.finish(.failure(error))
+            }
             group.notify(queue: finishQueue) {
-                guard !completion.isFinished else { return }
+                guard !failure.shouldStop else { return }
                 if reader.status == .failed {
-                    recordError(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
+                    failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
+                    return
+                }
+                if writer.status == .failed {
+                    failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
+                    return
                 }
                 writer.finishWriting {
+                    guard !failure.shouldStop else { return }
                     if writer.status != .completed {
-                        recordError(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing did not complete"))
+                        failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing did not complete"))
+                        return
                     }
-                    if let e = firstError { completion.finish(.failure(e)) }
-                    else { completion.finish(.success(())) }
+                    failure.finishSuccessfully { completion.finish(.success(())) }
                 }
             }
           }
         } onCancel: {
-            // Serialize native cancellation with finishWriting registration.
-            finishQueue.async {
-                completion.finish(.failure(EngineError.cancelled)) {
-                    reader.cancelReading()
-                    writer.cancelWriting()
-                }
-            }
+            failure.fail(EngineError.cancelled)
         }
         return videoCopied
     }
