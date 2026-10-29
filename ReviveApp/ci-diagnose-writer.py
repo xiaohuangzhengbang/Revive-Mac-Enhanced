@@ -3,11 +3,14 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import hashlib
 import os
 import platform
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
@@ -23,9 +26,20 @@ metadata_delay = int(env.get('REVIVE_WRITER_META_DELAY_MS', '0') or '0')
 assert 0 <= metadata_delay <= 250
 env['REVIVE_WRITER_META_DELAY_MS'] = str(metadata_delay)
 env['REVIVE_WRITER_TRACE_DIR'] = str(OUT)
+engine_ref = env.get('REVIVE_DIAGNOSTIC_ENGINE_REF', '')
+allowed_baselines = {'cfebf02826f2bd9790a82b62d9b1a9e506e6fe46',
+                     '7e11055dd2db2942d9b29c9770fbda3a1eaeb331'}
+if engine_ref:
+    assert engine_ref in allowed_baselines and metadata_delay == 0
+    subprocess.run(['git', 'fetch', '--depth=1', 'origin', engine_ref], cwd=ROOT, check=True)
+    historical = subprocess.check_output(['git', 'show', engine_ref + ':ReviveApp/Sources/Revive/Engine.swift'], cwd=ROOT)
+    (ROOT / 'Sources/Revive/Engine.swift').write_bytes(historical)
+    (OUT / 'CounterfactualEngine.swift.txt').write_bytes(historical)
 environment = {'sourceCommit': env.get('GITHUB_SHA'), 'architecture': platform.machine(),
     'iterations': iterations, 'reuseItem': env.get('REVIVE_STRESS_REUSE_ITEM', '0'),
     'metadataDelayMs': metadata_delay,
+    'engineReference': engine_ref or env.get('GITHUB_SHA'),
+    'engineSourceSHA256': hashlib.sha256((ROOT / 'Sources/Revive/Engine.swift').read_bytes()).hexdigest(),
     'testFilter': 'EngineTests|testRepeatedNativePreviewsKeepProducingVerifiedPairs',
     'startedAtUtc': datetime.now(timezone.utc).isoformat()}
 (OUT / 'Environment.json').write_text(json.dumps(environment, indent=2), encoding='utf-8')
@@ -53,6 +67,18 @@ def test_pids():
     return found
 
 def sample(reason):
+    # Preserve the closed intermediate movie even for historical engines that
+    # have no in-process trace. This only reads our synthetic test scratch root.
+    for source in Path(tempfile.gettempdir()).glob('Revive-*/Preview_*/.revive-*/prepared.MOV'):
+        destination = OUT / f'Forensic-{last_iteration}-{source.parent.name}'
+        destination.mkdir(exist_ok=True)
+        for media in (source, source.with_name('IMG_LIVE.MOV')):
+            target = destination / media.name
+            if media.exists() and not target.exists():
+                try:
+                    shutil.copy2(media, target)
+                except OSError as error:
+                    (destination / 'CopyError.txt').write_text(str(error), encoding='utf-8')
     for pid in test_pids():
         target = OUT / f'Stack-{last_iteration}-{reason}-pid{pid}.txt'
         try:
