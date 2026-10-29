@@ -26,12 +26,17 @@ on:
         type: choice
         options: [debug, release]
         default: debug
+      replay_fixture:
+        description: Directly replay the exact prepared MOV from the captured stall
+        required: true
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: writer-diagnostic-${{ github.ref }}
+  group: writer-diagnostic-${{ github.ref }}-${{ inputs.replay_fixture }}-${{ inputs.configuration }}
   cancel-in-progress: false
 
 jobs:
@@ -60,6 +65,7 @@ jobs:
           REVIVE_WRITER_META_DELAY_MS: ${{ inputs.metadata_delay_ms }}
           REVIVE_DIAGNOSTIC_ENGINE_REF: ${{ inputs.engine_reference }}
           REVIVE_DIAGNOSTIC_CONFIGURATION: ${{ inputs.configuration }}
+          REVIVE_DIAGNOSTIC_REPLAY: ${{ inputs.replay_fixture && '1' || '0' }}
         run: python3 ReviveApp/ci-diagnose-writer.py
       - name: Preserve diagnostics even when the native process fails or hangs
         if: always()
