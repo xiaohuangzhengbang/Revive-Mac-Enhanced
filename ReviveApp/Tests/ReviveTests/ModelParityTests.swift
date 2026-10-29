@@ -79,6 +79,36 @@ final class ModelParityTests: XCTestCase {
         XCTAssertEqual(try SafeExport.sha256(source), originalHash)
     }
 
+    @MainActor
+    func testRepeatedNativePreviewsKeepProducingVerifiedPairs() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_synthetic_six_seconds",
+            withExtension: "mp4", subdirectory: "Fixtures"))
+        let original = try SafeExport.sha256(source)
+        for iteration in 0..<6 {
+            let model = AppModel()
+            model.add(urls: [source])
+            let item = try XCTUnwrap(model.items.first)
+            defer { item.invalidatePreview() }
+            let deadline = Date().addingTimeInterval(20)
+            while item.state == .loading && Date() < deadline {
+                try await Task.sleep(nanoseconds: 20_000_000)
+            }
+            XCTAssertEqual(item.state, .ready)
+            item.trimStart = 1.11
+            item.trimEnd = 4.11
+            item.frameTime = 1.49
+            let prepared = await model.convert(item)
+            guard prepared else {
+                XCTFail("Native preview iteration \(iteration): \(item.state); checks=\(item.checks)")
+                return
+            }
+            XCTAssertTrue(item.previewReady)
+            XCTAssertFalse(item.checks.isEmpty)
+            XCTAssertTrue(item.checks.allSatisfy { $0.status == .pass })
+            XCTAssertEqual(try SafeExport.sha256(source), original)
+        }
+    }
+
     func testReceiptDoesNotCallEmptyOrWarningChecksAFilePass() throws {
         let result = ConversionResult(imageURL: URL(fileURLWithPath: "/test/IMG_LIVE.JPG"),
                                       movURL: URL(fileURLWithPath: "/test/IMG_LIVE.MOV"), assetID: UUID().uuidString,

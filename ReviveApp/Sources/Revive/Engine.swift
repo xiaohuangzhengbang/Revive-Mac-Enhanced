@@ -358,6 +358,10 @@ enum LivePhotoEngine {
         let queue: DispatchQueue
         private let group: DispatchGroup
         private(set) var isFinished = false
+        private let diagnosticLock = NSLock()
+        private var phase = "waiting for first readiness callback"
+        private var samples = 0
+        private var lastPTS: Double?
 
         init(label: String, group: DispatchGroup) {
             queue = DispatchQueue(label: label)
@@ -369,8 +373,20 @@ enum LivePhotoEngine {
             dispatchPrecondition(condition: .onQueue(queue))
             guard !isFinished else { return }
             isFinished = true
+            note("finished")
             beforeLeave()
             group.leave()
+        }
+
+        func note(_ phase: String, appendedPTS: Double? = nil) {
+            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+            self.phase = phase
+            if let appendedPTS { samples += 1; lastPTS = appendedPTS }
+        }
+
+        var diagnostic: String {
+            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+            return "\(queue.label): \(phase), samples=\(samples), lastPTS=\(lastPTS.map(String.init(describing:)) ?? "none")"
         }
     }
 
@@ -793,6 +809,12 @@ enum LivePhotoEngine {
         let failure = FailureCoordinator(finishQueue: finishQueue)
         try await withTaskCancellationHandler {
           try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            let group = DispatchGroup()
+            let metaPump = WritePump(label: "revive.meta", group: group)
+            let mediaPumps = pairs.enumerated().map { index, pair in
+                WritePump(label: "revive.pump.\(index).\(pair.1.mediaType.rawValue)", group: group)
+            }
+            let pumps = [metaPump] + mediaPumps
             let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "revive.watchdog"))
             watchdog.schedule(deadline: .now() + 5, repeating: 5)
             watchdog.setEventHandler {
@@ -803,27 +825,27 @@ enum LivePhotoEngine {
                     } else if writer.status == .failed {
                         failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
                     } else if completion.hasStalled {
-                        failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds"))
+                        let detail = pumps.map(\.diagnostic).joined(separator: "; ")
+                        failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds; reader=\(reader.status.rawValue), writer=\(writer.status.rawValue); \(detail)"))
                     }
                 }
             }
             // A suspended dispatch source must be resumed even on early cancel.
             watchdog.resume()
             guard completion.begin(cont, timer: watchdog) else { return }
-            let group = DispatchGroup()
             // Enter every input before any callback can fail or finish. Forced
             // stop runs on these same queues, even for inputs never made ready.
-            let metaPump = WritePump(label: "revive.meta", group: group)
-            let mediaPumps = pairs.indices.map { WritePump(label: "revive.pump.\($0)", group: group) }
-            let pumps = [metaPump] + mediaPumps
             metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
-                guard !metaPump.isFinished, !failure.shouldStop,
-                      metaInput.isReadyForMoreMediaData else { return }
+                guard !metaPump.isFinished, !failure.shouldStop else { return }
+                metaPump.note("readiness callback: ready=\(metaInput.isReadyForMoreMediaData)")
+                guard metaInput.isReadyForMoreMediaData else { return }
+                metaPump.note("appending metadata")
                 if !adaptor.append(stillGroup) {
                     failure.fail(EngineError.cannotWrite(
                         "still-image-time append failed: \(writer.error?.localizedDescription ?? "?")"))
                     return
                 }
+                metaPump.note("metadata appended", appendedPTS: stillTimeAbs.seconds)
                 completion.noteProgress()
                 metaPump.finish {
                     if !failure.shouldStop, writer.status == .writing { metaInput.markAsFinished() }
@@ -834,15 +856,19 @@ enum LivePhotoEngine {
                 let pump = mediaPumps[index]
                 input.requestMediaDataWhenReady(on: pump.queue) {
                     guard !pump.isFinished, !failure.shouldStop else { return }
+                    pump.note("readiness callback: ready=\(input.isReadyForMoreMediaData)")
                     while input.isReadyForMoreMediaData {
                         guard !failure.shouldStop else { return }
+                        pump.note("reading sample")
                         if let sbuf = output.copyNextSampleBuffer() {
                             guard !failure.shouldStop else { return }
+                            pump.note("appending sample")
                             if !input.append(sbuf) {
                                 failure.fail(EngineError.cannotWrite(
                                     "sample append failed: \(writer.error?.localizedDescription ?? "?")"))
                                 return
                             }
+                            pump.note("sample appended", appendedPTS: CMSampleBufferGetPresentationTimeStamp(sbuf).seconds)
                             completion.noteProgress()
                         } else {
                             if reader.status == .failed {
@@ -855,6 +881,7 @@ enum LivePhotoEngine {
                             return
                         }
                     }
+                    pump.note("not ready; waiting for next callback")
                 }
             }
 
