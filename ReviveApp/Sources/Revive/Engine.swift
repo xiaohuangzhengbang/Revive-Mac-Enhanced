@@ -448,13 +448,15 @@ enum LivePhotoEngine {
         }
     }
 
-    /// All accesses, including forced stop, stay on this input's serial queue.
+    /// Mutable accesses, including forced stop, stay on this input's serial queue.
+    /// Immutable failure statistics are published after every queue has drained.
     /// A failed writer may never invoke another readiness callback.
     final class WritePump: @unchecked Sendable {
         let queue: DispatchQueue
         private let group: DispatchGroup
         private(set) var isFinished = false
-        private let diagnosticLock = NSLock()
+        // Mutable statistics belong exclusively to queue. FailureCoordinator
+        // publishes one immutable snapshot through its drained DispatchGroup.
         private var phase = "waiting for first readiness callback"
         private var samples = 0
         private var lastPTS: Double?
@@ -464,6 +466,7 @@ enum LivePhotoEngine {
         private var sampleCount = 0
         private var eof = false
         private var markedFinished = false
+        private var frozenStats: [String: Any]?
 
         init(label: String, group: DispatchGroup) {
             queue = DispatchQueue(label: label)
@@ -481,7 +484,6 @@ enum LivePhotoEngine {
         }
 
         func note(_ phase: String, appendedPTS: Double? = nil, appendedDTS: Double? = nil) {
-            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
             self.phase = phase
             if phase == "appending sample" || phase == "appending metadata" { appendAttempts += 1 }
             if let appendedPTS { samples += 1; lastPTS = appendedPTS }
@@ -491,28 +493,47 @@ enum LivePhotoEngine {
         }
 
         func noteRead(_ sample: CMSampleBuffer) {
-            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
             reads += 1
             sampleCount += CMSampleBufferGetNumSamples(sample)
         }
 
         func snapshot(ready: Bool) -> [String: Any] {
-            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+            dispatchPrecondition(condition: .onQueue(queue))
+            var snapshot = statistics
+            snapshot["ready"] = ready
+            return snapshot
+        }
+
+        func freezeForFailure() {
+            dispatchPrecondition(condition: .onQueue(queue))
+            // Capture the real EOF/finish state before forced stop calls finish.
+            // Every later readiness callback returns at its shouldStop guard.
+            frozenStats = statistics
+            finish()
+        }
+
+        /// Only called after FailureCoordinator's drained group notifies. Its
+        /// queue blocks have finished publishing, and no pump can mutate again.
+        func snapshotAfterDrain(ready: Bool) -> [String: Any] {
+            precondition(frozenStats != nil, "Pump statistics must be frozen before cross-queue access")
+            var snapshot = frozenStats!
+            snapshot["ready"] = ready
+            snapshot["drained"] = true
+            return snapshot
+        }
+
+        private var statistics: [String: Any] {
             func number(_ value: Double?) -> Any {
                 guard let value, value.isFinite else { return NSNull() }
                 return value
             }
-            return ["queue": queue.label, "phase": phase, "ready": ready,
+            return ["queue": queue.label, "phase": phase, "finished": isFinished,
                     "readBuffers": reads, "readSamples": sampleCount,
                     "appendAttempts": appendAttempts, "appendBuffers": samples,
                     "lastPTS": number(lastPTS), "lastDTS": number(lastDTS),
                     "eof": eof, "markAsFinishedReturned": markedFinished]
         }
 
-        var diagnostic: String {
-            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
-            return "\(queue.label): \(phase), samples=\(samples), lastPTS=\(lastPTS.map(String.init(describing:)) ?? "none")"
-        }
     }
 
     /// Preserve the first failure and drain every input before native teardown.
@@ -589,7 +610,7 @@ enum LivePhotoEngine {
                     observe?("drain.enqueued", ["queue": pump.queue.label])
                     pump.queue.async {
                         observe?("drain.enter", ["queue": pump.queue.label])
-                        pump.finish()
+                        pump.freezeForFailure()
                         observe?("drain.return", ["queue": pump.queue.label])
                         drained.leave()
                     }
@@ -610,6 +631,7 @@ enum LivePhotoEngine {
         private var result: Result<Void, Error>?
         private var timer: DispatchSourceTimer?
         private var lastProgress = DispatchTime.now().uptimeNanoseconds
+        private var stage = "pumping"
 
         var isFinished: Bool {
             lock.lock(); defer { lock.unlock() }
@@ -632,6 +654,15 @@ enum LivePhotoEngine {
 
         func noteProgress() {
             lock.lock(); lastProgress = DispatchTime.now().uptimeNanoseconds; lock.unlock()
+        }
+
+        func noteStage(_ stage: String) {
+            lock.lock(); self.stage = stage; lock.unlock()
+        }
+
+        var currentStage: String {
+            lock.lock(); defer { lock.unlock() }
+            return stage
         }
 
         var hasStalled: Bool {
@@ -1007,14 +1038,25 @@ enum LivePhotoEngine {
             watchdog.schedule(deadline: .now() + 5, repeating: 5)
             watchdog.setEventHandler {
                 // This observation must not depend on finishQueue progressing.
-                // Native readiness is sampled directly; never queue.sync a pump.
-                trace?.event("watchdog.snapshot", fields: ["readerStatus": reader.status.rawValue,
-                    "writerStatus": writer.status.rawValue, "stalled": completion.hasStalled,
-                    "shouldStop": failure.shouldStop, "pumps": pumps.enumerated().map { index, pump in
-                        pump.snapshot(ready: index == 0 ? metaInput.isReadyForMoreMediaData
-                                                       : pairs[index - 1].1.isReadyForMoreMediaData)
-                    }])
-                if completion.hasStalled { trace?.preserveFailure("watchdog no-progress deadline") }
+                // Read each pump only on its own queue; a missing reply is
+                // evidence for the independent native stack sampler to inspect.
+                #if DEBUG
+                if let trace {
+                    let snapshotID = UUID().uuidString
+                    trace.event("watchdog.snapshot", fields: ["snapshotID": snapshotID,
+                        "readerStatus": reader.status.rawValue, "writerStatus": writer.status.rawValue,
+                        "stage": completion.currentStage, "stalled": completion.hasStalled,
+                        "shouldStop": failure.shouldStop])
+                    for (index, pump) in pumps.enumerated() {
+                        let input = index == 0 ? metaInput : pairs[index - 1].1
+                        pump.queue.async {
+                            trace.event("watchdog.pumpSnapshot", fields: pump.snapshot(
+                                ready: input.isReadyForMoreMediaData).merging(["snapshotID": snapshotID]) { _, new in new })
+                        }
+                    }
+                    if completion.hasStalled { trace.preserveFailure("watchdog no-progress deadline") }
+                }
+                #endif
                 finishQueue.async {
                     guard !failure.shouldStop else { return }
                     if reader.status == .failed {
@@ -1022,9 +1064,8 @@ enum LivePhotoEngine {
                     } else if writer.status == .failed {
                         failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
                     } else if completion.hasStalled {
-                        let detail = pumps.map(\.diagnostic).joined(separator: "; ")
-                        trace?.event("watchdog.failure", phase: "draining", fields: ["detail": detail])
-                        failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds; reader=\(reader.status.rawValue), writer=\(writer.status.rawValue); \(detail)"))
+                        trace?.event("watchdog.failure", phase: "draining")
+                        failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds"))
                     }
                 }
             }
@@ -1035,7 +1076,7 @@ enum LivePhotoEngine {
             // stop runs on these same queues, even for inputs never made ready.
             metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
                 guard !metaPump.isFinished, !failure.shouldStop else { return }
-                metaPump.note("readiness callback: ready=\(metaInput.isReadyForMoreMediaData)")
+                metaPump.note("readiness callback")
                 trace?.event("readiness", fields: ["queue": metaPump.queue.label,
                                                    "ready": metaInput.isReadyForMoreMediaData])
                 guard metaInput.isReadyForMoreMediaData else { return }
@@ -1068,7 +1109,7 @@ enum LivePhotoEngine {
                 let pump = mediaPumps[index]
                 input.requestMediaDataWhenReady(on: pump.queue) {
                     guard !pump.isFinished, !failure.shouldStop else { return }
-                    pump.note("readiness callback: ready=\(input.isReadyForMoreMediaData)")
+                    pump.note("readiness callback")
                     trace?.event("readiness", fields: ["queue": pump.queue.label,
                                                        "ready": input.isReadyForMoreMediaData])
                     while input.isReadyForMoreMediaData {
@@ -1126,8 +1167,24 @@ enum LivePhotoEngine {
             failure.activate(pumps: pumps) { error in
                 // All input queues have drained; no copy, append or normal EOF
                 // marker can overlap native cancellation or output cleanup.
+                // The group's publication barrier permits these immutable reads
+                // without adding locks or native readiness queries per sample.
+                let frozen = pumps.enumerated().map { index, pump in
+                    pump.snapshotAfterDrain(ready: index == 0 ? metaInput.isReadyForMoreMediaData
+                                                             : pairs[index - 1].1.isReadyForMoreMediaData)
+                }
+                let details: [String: Any] = ["stage": completion.currentStage,
+                    "readerStatus": reader.status.rawValue, "writerStatus": writer.status.rawValue,
+                    "pumps": frozen]
+                var reportedError = error
+                if case EngineError.cannotWrite(let message) = error,
+                   message == "Media writer made no progress for 120 seconds",
+                   let data = try? JSONSerialization.data(withJSONObject: details, options: [.sortedKeys]),
+                   let diagnostic = String(data: data, encoding: .utf8) {
+                    reportedError = EngineError.cannotWrite("\(message); \(diagnostic)")
+                }
                 trace?.event("failure.drained", fields: ["error": error.localizedDescription,
-                    "readerStatus": reader.status.rawValue, "writerStatus": writer.status.rawValue])
+                                                         "details": details])
                 trace?.preserveFailure(error.localizedDescription)
                 if reader.status == .reading {
                     trace?.event("cancelReading.enter", phase: "cancelling reader")
@@ -1140,13 +1197,14 @@ enum LivePhotoEngine {
                     trace?.event("cancelWriting.return", fields: ["writerStatus": writer.status.rawValue])
                 }
                 trace?.event("completion.failure", phase: "failed")
-                completion.finish(.failure(error))
+                completion.finish(.failure(reportedError))
             }
             group.notify(queue: finishQueue) {
                 trace?.event("group.notify", fields: ["readerStatus": reader.status.rawValue,
                                                       "writerStatus": writer.status.rawValue,
                                                       "shouldStop": failure.shouldStop])
                 guard !failure.shouldStop else { return }
+                completion.noteStage("group.notify")
                 if reader.status == .failed {
                     failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
                     return
@@ -1155,8 +1213,10 @@ enum LivePhotoEngine {
                     failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
                     return
                 }
+                completion.noteStage("finishWriting entered")
                 trace?.event("finishWriting.enter", phase: "finishing writer")
                 writer.finishWriting {
+                    completion.noteStage("finishWriting callback")
                     trace?.event("finishWriting.callback", fields: ["writerStatus": writer.status.rawValue,
                                                                     "shouldStop": failure.shouldStop])
                     guard !failure.shouldStop else { return }
@@ -1169,6 +1229,7 @@ enum LivePhotoEngine {
                         completion.finish(.success(()))
                     }
                 }
+                completion.noteStage("finishWriting returned")
                 trace?.event("finishWriting.return")
             }
           }
