@@ -65,8 +65,9 @@ def test_pids():
         if len(fields) == 2 and str(ROOT / '.build') in fields[1] and \
                 'RevivePackageTests.xctest' in fields[1]:
             pid = int(fields[0])
-            if os.getpgid(pid) == process.pid:
-                found.append(pid)
+            # XCTest may create its own process group via NSTask. Ownership is
+            # bound to this checkout's exact test bundle, not its group number.
+            found.append(pid)
     return found
 
 def sample(reason):
@@ -82,11 +83,18 @@ def sample(reason):
                     shutil.copy2(media, target)
                 except OSError as error:
                     (destination / 'CopyError.txt').write_text(str(error), encoding='utf-8')
-    for pid in test_pids():
+    pids = test_pids()
+    sample_results = OUT / 'SamplerResults.jsonl'
+    with sample_results.open('a', encoding='utf-8') as results:
+        results.write(json.dumps({'reason': reason, 'iteration': last_iteration, 'testPids': pids}) + '\n')
+    for pid in pids:
         target = OUT / f'Stack-{last_iteration}-{reason}-pid{pid}.txt'
         try:
-            subprocess.run(['sample', str(pid), '3', '-file', str(target)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12, check=False)
+            result = subprocess.run(['sample', str(pid), '3', '-file', str(target)],
+                capture_output=True, text=True, timeout=12, check=False)
+            with sample_results.open('a', encoding='utf-8') as results:
+                results.write(json.dumps({'reason': reason, 'pid': pid, 'exitCode': result.returncode,
+                    'stderr': result.stderr[-2000:], 'stackBytes': target.stat().st_size if target.exists() else 0}) + '\n')
         except subprocess.TimeoutExpired:
             (OUT / 'SamplerTimeout.txt').write_text('sample did not return in 12 seconds', encoding='utf-8')
 
@@ -127,10 +135,20 @@ try:
         time.sleep(2)
 finally:
     if process.poll() is None:
+        for pid in test_pids():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
         os.killpg(process.pid, signal.SIGTERM)
         try:
             process.wait(timeout=10)
         except subprocess.TimeoutExpired:
+            for pid in test_pids():
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             os.killpg(process.pid, signal.SIGKILL)
     return_code = process.wait()
     test_log.close()
