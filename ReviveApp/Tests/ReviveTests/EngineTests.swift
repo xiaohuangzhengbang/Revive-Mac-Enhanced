@@ -245,6 +245,179 @@ final class EngineTests: XCTestCase {
         }
     }
 
+    func testFallbackDriverWaitsForReadinessAndResumesWithoutNativeCallback() async {
+        // All fake source/sink state belongs to the production pump's queue.
+        final class State: @unchecked Sendable {
+            var ready = false
+            var checks = 0
+            var blockedChecks = 0
+            var reads = 0
+            var appends = 0
+            var eof = 0
+            var marks = 0
+            var checksAtFinish = 0
+            var groupNotifications = 0
+        }
+        let state = State()
+        let group = DispatchGroup()
+        let pump = LivePhotoEngine.WritePump(label: "test.write.driver.recovery", group: group)
+        let initiallyBlocked = expectation(description: "two not-ready timer checks without reading")
+        let sampleWritten = expectation(description: "ready transition writes one source buffer")
+        let blockedAgain = expectation(description: "backpressure after the first buffer")
+        let finished = expectation(description: "second unannounced ready transition reaches EOF")
+        let quietAfterFinish = expectation(description: "finished driver remains stopped")
+        pump.installFallbackDriver(interval: .milliseconds(20), shouldStop: { false }, isReady: {
+            dispatchPrecondition(condition: .onQueue(pump.queue))
+            state.checks += 1
+            if !state.ready {
+                state.blockedChecks += 1
+                if state.blockedChecks == 2 {
+                    if state.reads == 0 { initiallyBlocked.fulfill() }
+                    else { blockedAgain.fulfill() }
+                }
+            }
+            return state.ready
+        }, drive: {
+            dispatchPrecondition(condition: .onQueue(pump.queue))
+            // The production driver itself must withhold this work when false.
+            XCTAssertTrue(state.ready)
+            state.reads += 1
+            if state.reads == 1 {
+                state.appends += 1
+                state.ready = false
+                state.blockedChecks = 0
+                sampleWritten.fulfill()
+            } else {
+                state.eof += 1
+                state.checksAtFinish = state.checks
+                pump.finish { state.marks += 1 }
+            }
+        })
+        group.notify(queue: pump.queue) {
+            state.groupNotifications += 1
+            finished.fulfill()
+        }
+
+        await fulfillment(of: [initiallyBlocked], timeout: 2)
+        XCTAssertEqual(pump.queue.sync { state.reads }, 0)
+        XCTAssertEqual(pump.queue.sync { state.appends }, 0)
+        // Deliberately send no native readiness callback, only change readiness.
+        pump.queue.async { state.ready = true }
+        await fulfillment(of: [sampleWritten, blockedAgain], timeout: 2)
+        XCTAssertEqual(pump.queue.sync { state.reads }, 1)
+        XCTAssertEqual(pump.queue.sync { state.appends }, 1)
+        pump.queue.async { state.ready = true }
+        await fulfillment(of: [finished], timeout: 2)
+        pump.queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
+            pump.finish { state.marks += 1000 }
+            XCTAssertEqual(state.reads, 2)
+            XCTAssertEqual(state.appends, 1)
+            XCTAssertEqual(state.eof, 1)
+            XCTAssertEqual(state.marks, 1)
+            XCTAssertEqual(state.checks, state.checksAtFinish)
+            XCTAssertEqual(state.groupNotifications, 1)
+            XCTAssertEqual(pump.snapshot(ready: state.ready)["fallbackTimerActive"] as? Bool, false)
+            quietAfterFinish.fulfill()
+        }
+        await fulfillment(of: [quietAfterFinish], timeout: 2)
+    }
+
+    func testFallbackDriverStopsOnCancellationBeforeReadinessReturns() async {
+        final class State: @unchecked Sendable {
+            var ready = false
+            var checks = 0
+            var reads = 0
+            var groupNotifications = 0
+        }
+        let state = State()
+        let group = DispatchGroup()
+        let pump = LivePhotoEngine.WritePump(label: "test.write.driver.cancel", group: group)
+        let finishQueue = DispatchQueue(label: "test.write.driver.cancel.finish")
+        let coordinator = LivePhotoEngine.FailureCoordinator(finishQueue: finishQueue)
+        let initiallyBlocked = expectation(description: "driver checked readiness while blocked")
+        let cancelled = expectation(description: "cancellation completed through safe drain")
+        let drained = expectation(description: "input group leaves once on cancellation")
+        let quietAfterCancellation = expectation(description: "cancelled driver remains stopped")
+        pump.installFallbackDriver(interval: .milliseconds(20), shouldStop: { coordinator.shouldStop }, isReady: {
+            dispatchPrecondition(condition: .onQueue(pump.queue))
+            state.checks += 1
+            if state.checks == 2 { initiallyBlocked.fulfill() }
+            return state.ready
+        }, drive: {
+            state.reads += 1
+            XCTFail("A cancelled input must never resume pulling source data")
+        })
+        coordinator.activate(pumps: [pump]) { error in
+            guard case EngineError.cancelled = error else {
+                XCTFail("Cancellation must remain the original failure"); cancelled.fulfill(); return
+            }
+            cancelled.fulfill()
+        }
+        group.notify(queue: pump.queue) {
+            state.groupNotifications += 1
+            drained.fulfill()
+        }
+        await fulfillment(of: [initiallyBlocked], timeout: 2)
+        pump.queue.async {
+            coordinator.fail(EngineError.cancelled)
+            state.ready = true
+        }
+        await fulfillment(of: [cancelled, drained], timeout: 2)
+        let checksAtCancellation = pump.queue.sync { state.checks }
+        pump.queue.asyncAfter(deadline: .now() + .milliseconds(100)) {
+            XCTAssertTrue(pump.isFinished)
+            XCTAssertEqual(state.reads, 0)
+            XCTAssertEqual(state.checks, checksAtCancellation)
+            XCTAssertEqual(state.groupNotifications, 1)
+            XCTAssertEqual(pump.snapshot(ready: state.ready)["fallbackTimerActive"] as? Bool, false)
+            quietAfterCancellation.fulfill()
+        }
+        await fulfillment(of: [quietAfterCancellation], timeout: 2)
+    }
+
+    func testFallbackDriverRejectsLateInstallationAndReleasesFinishedPump() async {
+        final class Lifetime: @unchecked Sendable {
+            weak var pump: LivePhotoEngine.WritePump?
+            var checks = 0
+        }
+        let installed = expectation(description: "fallback timer was installed and ticked")
+        let lateInstallChecked = expectation(description: "late installation remained stopped")
+        let released = expectation(description: "finished timer releases its strongly captured pump")
+        func exerciseLifetime() async -> Lifetime {
+            let lifetime = Lifetime()
+            let group = DispatchGroup()
+            let pump = LivePhotoEngine.WritePump(label: "test.write.driver.lifetime", group: group)
+            lifetime.pump = pump
+            pump.installFallbackDriver(interval: .milliseconds(20), shouldStop: { false }, isReady: {
+                lifetime.checks += 1
+                if lifetime.checks == 1 { installed.fulfill() }
+                return false
+            }, drive: {
+                // Deliberately establish timer -> drive -> pump ownership.
+                // finish must clear the handler, rather than rely on weak self.
+                pump.finish()
+            })
+            await fulfillment(of: [installed], timeout: 2)
+            pump.queue.async {
+                pump.finish()
+                pump.installFallbackDriver(interval: .milliseconds(20), shouldStop: { false },
+                                           isReady: { true }, drive: { pump.finish() })
+                pump.queue.async {
+                    XCTAssertEqual(pump.snapshot(ready: true)["fallbackTimerActive"] as? Bool, false)
+                    lateInstallChecked.fulfill()
+                }
+            }
+            await fulfillment(of: [lateInstallChecked], timeout: 2)
+            return lifetime
+        }
+        let lifetime = await exerciseLifetime()
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(100)) {
+            XCTAssertNil(lifetime.pump, "A finished driver must not retain the native operation")
+            released.fulfill()
+        }
+        await fulfillment(of: [released], timeout: 2)
+    }
+
     func testWriteFailureDrainsNeverReadyPumpAndPreservesFirstError() async {
         let finishQueue = DispatchQueue(label: "test.write.failure.finish")
         let group = DispatchGroup()

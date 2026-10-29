@@ -20,8 +20,8 @@
 
 ```bash
 cd ReviveApp
-bash build.sh           # 先运行完整原生 XCTest，再构建 arm64+x86_64 universal 应用
-bash build.sh --native  # 仅构建当前 Mac 架构，同样先运行完整原生 XCTest
+bash build.sh           # 先运行完整 Debug 和 Release 原生 XCTest，再构建 arm64+x86_64 universal 应用
+bash build.sh --native  # 仅构建当前 Mac 架构，同样先运行完整 Debug 和 Release 原生 XCTest
 ```
 
 每次构建使用新的 `build/Enhanced-<时间>-<UUID>` 目录。脚本不安装或覆盖已有应用，也不修改 Finder、Dock 或服务设置。只有测试、编译、架构检查、ad hoc 签名验证及 ZIP 打包全部成功，`BuildReceipt.json` 才记录 `BUILT_TESTED_NOT_DEVICE_ACCEPTED`。
@@ -59,3 +59,11 @@ bash ci-verify-app.sh "build/Enhanced-<时间>-<UUID>"
 4. 如果系统提示应用已损坏、会损害电脑或检测到恶意软件，应停止打开并核对包、哈希与签名，不将此类提示当作普通首次打开确认。
 
 繁體中文：[README.zh-Hant.md](README.zh-Hant.md)。
+
+## 原生写入停滞回归
+
+保留的合成故障夹具为 `Tests/ReviveTests/Fixtures/TEST_writer_stall_prepared.mov`。它来自实际超时现场，包含 HEVC 视频与 AAC 音频，仅供测试。专用诊断工作流支持 Debug/Release、固定重放次数以及新建/复用预览项，遇到首个失败即停并保存错误、线程采样和中间文件。实际用户素材不会上传到此工作流。
+
+修复前的现场显示：reader/writer 均仍在读写，元数据轨道已结束；音频只读取了 95/142 个样本，其输入已恢复可写，但原生 readiness 回调没有再次执行，视频也因此等待。应用不能把后续推进完全寄托在该回调上。每条轨道现在由同一串行队列上的 250ms 定时检查兜底唤醒，并复用原回调逻辑：只在 ready 时读写；结束、失败或取消时撤销检查。定时检查本身不计作媒体进展，原 120 秒无进展保护保留。
+
+构建脚本现在要求 Debug 与 Release 两套原生 XCTest 均通过，之后才构建和签名应用。验收应同时核对两套测试日志，不能用 Debug 的成功代替优化后 Release 的稳定性。

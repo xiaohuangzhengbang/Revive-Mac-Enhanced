@@ -467,6 +467,8 @@ enum LivePhotoEngine {
         private var eof = false
         private var markedFinished = false
         private var frozenStats: [String: Any]?
+        private var fallbackTimer: DispatchSourceTimer?
+        private var fallbackDrives = 0
 
         init(label: String, group: DispatchGroup) {
             queue = DispatchQueue(label: label)
@@ -478,9 +480,41 @@ enum LivePhotoEngine {
             dispatchPrecondition(condition: .onQueue(queue))
             guard !isFinished else { return }
             isFinished = true
+            fallbackTimer?.setEventHandler {}
+            fallbackTimer?.cancel()
+            fallbackTimer = nil
             note("finished")
             beforeLeave()
             group.leave()
+        }
+
+        /// Native readiness notifications can leave a ready input without
+        /// another callback. Recheck on this same serial queue, using the exact
+        /// native callback body; never pull samples or append while not ready.
+        /// A dispatch source coalesces ticks while a callback is busy.
+        func installFallbackDriver(
+            interval: DispatchTimeInterval = .milliseconds(250),
+            shouldStop: @escaping @Sendable () -> Bool,
+            isReady: @escaping @Sendable () -> Bool,
+            drive: @escaping @Sendable () -> Void,
+            onRecovery: (@Sendable () -> Void)? = nil
+        ) {
+            // Enqueue before registering the native callback so initialization
+            // and all subsequent access remain ordered on this queue.
+            queue.async {
+                guard !self.isFinished, self.fallbackTimer == nil else { return }
+                let timer = DispatchSource.makeTimerSource(queue: self.queue)
+                timer.schedule(deadline: .now() + interval, repeating: interval,
+                               leeway: .milliseconds(10))
+                timer.setEventHandler { [weak self] in
+                    guard let self, !self.isFinished, !shouldStop(), isReady() else { return }
+                    self.fallbackDrives += 1
+                    onRecovery?()
+                    drive()
+                }
+                self.fallbackTimer = timer
+                timer.resume()
+            }
         }
 
         func note(_ phase: String, appendedPTS: Double? = nil, appendedDTS: Double? = nil) {
@@ -531,7 +565,8 @@ enum LivePhotoEngine {
                     "readBuffers": reads, "readSamples": sampleCount,
                     "appendAttempts": appendAttempts, "appendBuffers": samples,
                     "lastPTS": number(lastPTS), "lastDTS": number(lastDTS),
-                    "eof": eof, "markAsFinishedReturned": markedFinished]
+                    "eof": eof, "markAsFinishedReturned": markedFinished,
+                    "fallbackDrives": fallbackDrives, "fallbackTimerActive": fallbackTimer != nil]
         }
 
     }
@@ -1074,7 +1109,7 @@ enum LivePhotoEngine {
             guard completion.begin(cont, timer: watchdog) else { return }
             // Enter every input before any callback can fail or finish. Forced
             // stop runs on these same queues, even for inputs never made ready.
-            metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
+            let driveMetadata: @Sendable () -> Void = {
                 guard !metaPump.isFinished, !failure.shouldStop else { return }
                 metaPump.note("readiness callback")
                 trace?.event("readiness", fields: ["queue": metaPump.queue.label,
@@ -1104,10 +1139,14 @@ enum LivePhotoEngine {
                     }
                 }
             }
+            metaPump.installFallbackDriver(shouldStop: { failure.shouldStop },
+                isReady: { metaInput.isReadyForMoreMediaData }, drive: driveMetadata,
+                onRecovery: { trace?.event("fallback.drive", fields: ["queue": metaPump.queue.label]) })
+            metaInput.requestMediaDataWhenReady(on: metaPump.queue, using: driveMetadata)
 
             for (index, (output, input)) in pairs.enumerated() {
                 let pump = mediaPumps[index]
-                input.requestMediaDataWhenReady(on: pump.queue) {
+                let driveMedia: @Sendable () -> Void = {
                     guard !pump.isFinished, !failure.shouldStop else { return }
                     pump.note("readiness callback")
                     trace?.event("readiness", fields: ["queue": pump.queue.label,
@@ -1162,6 +1201,10 @@ enum LivePhotoEngine {
                     trace?.event("readiness.wait", fields: ["queue": pump.queue.label,
                                                            "ready": input.isReadyForMoreMediaData])
                 }
+                pump.installFallbackDriver(shouldStop: { failure.shouldStop },
+                    isReady: { input.isReadyForMoreMediaData }, drive: driveMedia,
+                    onRecovery: { trace?.event("fallback.drive", fields: ["queue": pump.queue.label]) })
+                input.requestMediaDataWhenReady(on: pump.queue, using: driveMedia)
             }
 
             failure.activate(pumps: pumps) { error in

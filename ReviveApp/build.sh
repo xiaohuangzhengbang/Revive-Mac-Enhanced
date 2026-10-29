@@ -35,6 +35,11 @@ find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -nam
 swift --version > "$OUT/SwiftVersion.txt"
 swift test 2>&1 | tee "$OUT/NativeTests.log"
 plutil -insert nativeTests -string PASS "$PLIST"
+plutil -insert debugNativeTests -string PASS "$PLIST"
+# Exercise optimized native writer scheduling too; a Debug-only pass previously
+# missed the intermittent readiness callback stall reproduced in Release.
+swift test -c release 2>&1 | tee -a "$OUT/NativeTests.log"
+plutil -insert releaseNativeTests -string PASS "$PLIST"
 
 ARCH_FLAGS=(--arch "$(uname -m)")
 if [[ "$MODE" == "universal" ]]; then ARCH_FLAGS=(--arch arm64 --arch x86_64); fi
