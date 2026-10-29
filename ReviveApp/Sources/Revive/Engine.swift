@@ -352,6 +352,102 @@ enum LivePhotoEngine {
         try? FileManager.default.removeItem(at: url)
     }
 
+    /// Opt-in diagnostics only. File writes have their own lock and never wait
+    /// on an input queue. Release builds never create a trace or copy media.
+    private final class WriterTrace: @unchecked Sendable {
+        #if DEBUG
+        private let lock = NSLock()
+        private let directory: URL
+        private let source: URL?
+        private let output: URL
+        private let handle: FileHandle
+        private let operationID: String
+        private var sequence = 0
+        private var phase = "setup"
+        private var preservedFailure = false
+        #endif
+
+        init?(asset: AVAsset, output: URL) {
+            #if DEBUG
+            guard let path = ProcessInfo.processInfo.environment["REVIVE_WRITER_TRACE_DIR"],
+                  !path.isEmpty else { return nil }
+            let operationID = UUID().uuidString
+            let directory = URL(fileURLWithPath: path, isDirectory: true)
+                .appendingPathComponent("writer-\(operationID)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                        attributes: [.posixPermissions: 0o700])
+                let log = directory.appendingPathComponent("writer.jsonl")
+                guard FileManager.default.createFile(atPath: log.path, contents: nil,
+                                                     attributes: [.posixPermissions: 0o600]) else { return nil }
+                self.handle = try FileHandle(forWritingTo: log)
+            } catch { return nil }
+            self.directory = directory
+            self.operationID = operationID
+            self.source = (asset as? AVURLAsset)?.url
+            self.output = output
+            event("trace.begin", fields: ["assetURL": source?.absoluteString ?? "unknown",
+                                          "outputURL": output.absoluteString,
+                                          "expectedSamples": "NOT_SCANNED",
+                                          "pid": ProcessInfo.processInfo.processIdentifier])
+            #else
+            return nil
+            #endif
+        }
+
+        func event(_ name: String, phase: String? = nil, fields: [String: Any] = [:]) {
+            #if DEBUG
+            lock.lock(); defer { lock.unlock() }
+            if let phase { self.phase = phase }
+            sequence += 1
+            var record = fields
+            record["event"] = name
+            record["phase"] = self.phase
+            record["operationID"] = operationID
+            record["sequence"] = sequence
+            record["unixTime"] = Date().timeIntervalSince1970
+            record["uptimeNanoseconds"] = DispatchTime.now().uptimeNanoseconds
+            guard var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+            data.append(0x0a)
+            try? handle.write(contentsOf: data)
+            #endif
+        }
+
+        static func sampleFields(_ sample: CMSampleBuffer) -> [String: Any] {
+            func number(_ time: CMTime) -> Any { time.seconds.isFinite ? time.seconds as Any : NSNull() }
+            return ["pts": number(CMSampleBufferGetPresentationTimeStamp(sample)),
+                    "dts": number(CMSampleBufferGetDecodeTimeStamp(sample)),
+                    "duration": number(CMSampleBufferGetDuration(sample)),
+                    "sampleCount": CMSampleBufferGetNumSamples(sample)]
+        }
+
+        /// Best effort forensic copies; never rename, delete or change sources.
+        /// A partial output copied while native writing is stuck may be invalid.
+        func preserveFailure(_ reason: String) {
+            #if DEBUG
+            lock.lock()
+            guard !preservedFailure else { lock.unlock(); return }
+            preservedFailure = true
+            lock.unlock()
+            event("failure.preserve.enter", fields: ["reason": reason])
+            for (label, url) in [("partial-output", Optional(output)), ("prepared-source", source)] {
+                guard let url, url.isFileURL else { continue }
+                let suffix = url.pathExtension.isEmpty ? "MOV" : url.pathExtension
+                let destination = directory.appendingPathComponent("\(label).\(suffix)")
+                do {
+                    try FileManager.default.copyItem(at: url, to: destination)
+                    event("failure.preserve.copied", fields: ["kind": label,
+                          "sourceURL": url.absoluteString, "copyURL": destination.absoluteString])
+                } catch {
+                    event("failure.preserve.failed", fields: ["kind": label,
+                          "error": error.localizedDescription])
+                }
+            }
+            event("failure.preserve.return")
+            #endif
+        }
+    }
+
     /// All accesses, including forced stop, stay on this input's serial queue.
     /// A failed writer may never invoke another readiness callback.
     final class WritePump: @unchecked Sendable {
@@ -362,6 +458,12 @@ enum LivePhotoEngine {
         private var phase = "waiting for first readiness callback"
         private var samples = 0
         private var lastPTS: Double?
+        private var lastDTS: Double?
+        private var reads = 0
+        private var appendAttempts = 0
+        private var sampleCount = 0
+        private var eof = false
+        private var markedFinished = false
 
         init(label: String, group: DispatchGroup) {
             queue = DispatchQueue(label: label)
@@ -378,10 +480,33 @@ enum LivePhotoEngine {
             group.leave()
         }
 
-        func note(_ phase: String, appendedPTS: Double? = nil) {
+        func note(_ phase: String, appendedPTS: Double? = nil, appendedDTS: Double? = nil) {
             diagnosticLock.lock(); defer { diagnosticLock.unlock() }
             self.phase = phase
+            if phase == "appending sample" || phase == "appending metadata" { appendAttempts += 1 }
             if let appendedPTS { samples += 1; lastPTS = appendedPTS }
+            if let appendedDTS { lastDTS = appendedDTS }
+            if phase == "EOF" { eof = true }
+            if phase == "markAsFinished returned" { markedFinished = true }
+        }
+
+        func noteRead(_ sample: CMSampleBuffer) {
+            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+            reads += 1
+            sampleCount += CMSampleBufferGetNumSamples(sample)
+        }
+
+        func snapshot(ready: Bool) -> [String: Any] {
+            diagnosticLock.lock(); defer { diagnosticLock.unlock() }
+            func number(_ value: Double?) -> Any {
+                guard let value, value.isFinite else { return NSNull() }
+                return value
+            }
+            return ["queue": queue.label, "phase": phase, "ready": ready,
+                    "readBuffers": reads, "readSamples": sampleCount,
+                    "appendAttempts": appendAttempts, "appendBuffers": samples,
+                    "lastPTS": number(lastPTS), "lastDTS": number(lastDTS),
+                    "eof": eof, "markAsFinishedReturned": markedFinished]
         }
 
         var diagnostic: String {
@@ -401,8 +526,12 @@ enum LivePhotoEngine {
         private var didFinish = false
         private var pumps: [WritePump] = []
         private var onFailure: ((Error) -> Void)?
+        private let observe: ((String, [String: Any]) -> Void)?
 
-        init(finishQueue: DispatchQueue) { self.finishQueue = finishQueue }
+        init(finishQueue: DispatchQueue, observe: ((String, [String: Any]) -> Void)? = nil) {
+            self.finishQueue = finishQueue
+            self.observe = observe
+        }
 
         var shouldStop: Bool {
             lock.lock(); defer { lock.unlock() }
@@ -412,9 +541,11 @@ enum LivePhotoEngine {
         func fail(_ error: Error) {
             lock.lock()
             guard !didFinish else { lock.unlock(); return }
+            let isFirstFailure = firstError == nil
             if firstError == nil { firstError = error }
             let stop = stopWorkIfReady()
             lock.unlock()
+            if isFirstFailure { observe?("failure.recorded", ["error": error.localizedDescription]) }
             stop?()
         }
 
@@ -448,18 +579,25 @@ enum LivePhotoEngine {
             stopScheduled = true
             let pending = pumps
             let finishQueue = finishQueue
+            let observe = observe
             pumps = []
             self.onFailure = nil
             return {
                 let drained = DispatchGroup()
                 for pump in pending {
                     drained.enter()
+                    observe?("drain.enqueued", ["queue": pump.queue.label])
                     pump.queue.async {
+                        observe?("drain.enter", ["queue": pump.queue.label])
                         pump.finish()
+                        observe?("drain.return", ["queue": pump.queue.label])
                         drained.leave()
                     }
                 }
-                drained.notify(queue: finishQueue) { onFailure(error) }
+                drained.notify(queue: finishQueue) {
+                    observe?("drain.allReturned", [:])
+                    onFailure(error)
+                }
             }
         }
     }
@@ -697,9 +835,21 @@ enum LivePhotoEngine {
         let writer: AVAssetWriter
         do { writer = try AVAssetWriter(outputURL: url, fileType: .mov) }
         catch { throw EngineError.cannotWrite(error.localizedDescription) }
+        let trace = WriterTrace(asset: asset, output: url)
         defer {
-            if reader.status == .reading { reader.cancelReading() }
-            if writer.status == .writing { writer.cancelWriting() }
+            trace?.event("scope.exit", fields: ["readerStatus": reader.status.rawValue,
+                                                "writerStatus": writer.status.rawValue])
+            if writer.status != .completed { trace?.preserveFailure("scope exited without completed writer") }
+            if reader.status == .reading {
+                trace?.event("defer.cancelReading.enter", phase: "cancelling reader")
+                reader.cancelReading()
+                trace?.event("defer.cancelReading.return", fields: ["readerStatus": reader.status.rawValue])
+            }
+            if writer.status == .writing {
+                trace?.event("defer.cancelWriting.enter", phase: "cancelling writer")
+                writer.cancelWriting()
+                trace?.event("defer.cancelWriting.return", fields: ["writerStatus": writer.status.rawValue])
+            }
         }
         writer.metadata = topLevelMetadata(assetID: assetID)
         writer.movieTimeScale = 60_000
@@ -767,6 +917,9 @@ enum LivePhotoEngine {
             guard writer.canAdd(input) else { throw EngineError.cannotWrite("can't write \(track.mediaType.rawValue) track") }
             writer.add(input)
             pairs.append((output, input))
+            trace?.event("track.configured", fields: ["index": pairs.count - 1,
+                          "mediaType": track.mediaType.rawValue, "passthrough": compatible,
+                          "expectedCompressedSamples": "NOT_SCANNED"])
         }
         guard pairs.contains(where: { $0.1.mediaType == .video }) else { throw EngineError.noVideoTrack }
 
@@ -787,14 +940,25 @@ enum LivePhotoEngine {
         // Give the marker the selected frame's interval, clipped at the end.
         // A one-tick interval can round to an empty edit and disappear on read.
         let markerDuration = CMTimeMinimum(markerFrameDuration, remaining)
-        guard reader.startReading() else {
+        trace?.event("startReading.enter", phase: "starting reader")
+        let readingStarted = reader.startReading()
+        trace?.event("startReading.return", fields: ["result": readingStarted,
+                                                    "readerStatus": reader.status.rawValue])
+        guard readingStarted else {
             throw EngineError.cannotRead(reader.error?.localizedDescription ?? "startReading failed")
         }
-        guard writer.startWriting() else {
+        trace?.event("startWriting.enter", phase: "starting writer")
+        let writingStarted = writer.startWriting()
+        trace?.event("startWriting.return", fields: ["result": writingStarted,
+                                                    "writerStatus": writer.status.rawValue])
+        guard writingStarted else {
             throw EngineError.cannotWrite(writer.error?.localizedDescription ?? "startWriting failed")
         }
         let sessionStart = timeRange?.start ?? .zero
+        trace?.event("startSession.enter", fields: ["start": sessionStart.seconds])
         writer.startSession(atSourceTime: sessionStart)
+        trace?.event("startSession.return", phase: "pumping", fields: ["stillTime": stillTimeAbs.seconds,
+                                                                     "markerDuration": markerDuration.seconds])
 
         let stillGroup = AVTimedMetadataGroup(
             items: [item(keyStillImageTime, NSNumber(value: 0), "com.apple.metadata.datatype.int8")],
@@ -806,7 +970,9 @@ enum LivePhotoEngine {
 
         let completion = WriteCompletion()
         let finishQueue = DispatchQueue(label: "revive.finish")
-        let failure = FailureCoordinator(finishQueue: finishQueue)
+        let failure = FailureCoordinator(finishQueue: finishQueue, observe: trace.map { trace in
+            { name, fields in trace.event(name, phase: "draining", fields: fields) }
+        })
         try await withTaskCancellationHandler {
           try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let group = DispatchGroup()
@@ -818,6 +984,15 @@ enum LivePhotoEngine {
             let watchdog = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "revive.watchdog"))
             watchdog.schedule(deadline: .now() + 5, repeating: 5)
             watchdog.setEventHandler {
+                // This observation must not depend on finishQueue progressing.
+                // Native readiness is sampled directly; never queue.sync a pump.
+                trace?.event("watchdog.snapshot", fields: ["readerStatus": reader.status.rawValue,
+                    "writerStatus": writer.status.rawValue, "stalled": completion.hasStalled,
+                    "shouldStop": failure.shouldStop, "pumps": pumps.enumerated().map { index, pump in
+                        pump.snapshot(ready: index == 0 ? metaInput.isReadyForMoreMediaData
+                                                       : pairs[index - 1].1.isReadyForMoreMediaData)
+                    }])
+                if completion.hasStalled { trace?.preserveFailure("watchdog no-progress deadline") }
                 finishQueue.async {
                     guard !failure.shouldStop else { return }
                     if reader.status == .failed {
@@ -826,6 +1001,7 @@ enum LivePhotoEngine {
                         failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
                     } else if completion.hasStalled {
                         let detail = pumps.map(\.diagnostic).joined(separator: "; ")
+                        trace?.event("watchdog.failure", phase: "draining", fields: ["detail": detail])
                         failure.fail(EngineError.cannotWrite("Media writer made no progress for 120 seconds; reader=\(reader.status.rawValue), writer=\(writer.status.rawValue); \(detail)"))
                     }
                 }
@@ -838,17 +1014,31 @@ enum LivePhotoEngine {
             metaInput.requestMediaDataWhenReady(on: metaPump.queue) {
                 guard !metaPump.isFinished, !failure.shouldStop else { return }
                 metaPump.note("readiness callback: ready=\(metaInput.isReadyForMoreMediaData)")
+                trace?.event("readiness", fields: ["queue": metaPump.queue.label,
+                                                   "ready": metaInput.isReadyForMoreMediaData])
                 guard metaInput.isReadyForMoreMediaData else { return }
                 metaPump.note("appending metadata")
+                trace?.event("metadata.append.enter", fields: ["pts": stillTimeAbs.seconds,
+                                                              "duration": markerDuration.seconds])
                 if !adaptor.append(stillGroup) {
+                    trace?.event("metadata.append.return", fields: ["result": false,
+                                                                   "writerStatus": writer.status.rawValue])
                     failure.fail(EngineError.cannotWrite(
                         "still-image-time append failed: \(writer.error?.localizedDescription ?? "?")"))
                     return
                 }
+                trace?.event("metadata.append.return", fields: ["result": true,
+                                                               "writerStatus": writer.status.rawValue])
                 metaPump.note("metadata appended", appendedPTS: stillTimeAbs.seconds)
                 completion.noteProgress()
                 metaPump.finish {
-                    if !failure.shouldStop, writer.status == .writing { metaInput.markAsFinished() }
+                    if !failure.shouldStop, writer.status == .writing {
+                        metaPump.note("markAsFinished entered")
+                        trace?.event("markAsFinished.enter", fields: ["queue": metaPump.queue.label])
+                        metaInput.markAsFinished()
+                        metaPump.note("markAsFinished returned")
+                        trace?.event("markAsFinished.return", fields: ["queue": metaPump.queue.label])
+                    }
                 }
             }
 
@@ -857,42 +1047,83 @@ enum LivePhotoEngine {
                 input.requestMediaDataWhenReady(on: pump.queue) {
                     guard !pump.isFinished, !failure.shouldStop else { return }
                     pump.note("readiness callback: ready=\(input.isReadyForMoreMediaData)")
+                    trace?.event("readiness", fields: ["queue": pump.queue.label,
+                                                       "ready": input.isReadyForMoreMediaData])
                     while input.isReadyForMoreMediaData {
                         guard !failure.shouldStop else { return }
                         pump.note("reading sample")
+                        trace?.event("read.enter", fields: ["queue": pump.queue.label])
                         if let sbuf = output.copyNextSampleBuffer() {
+                            pump.noteRead(sbuf)
+                            trace?.event("read.return", fields: WriterTrace.sampleFields(sbuf).merging(
+                                ["queue": pump.queue.label, "hasSample": true]) { _, new in new })
                             guard !failure.shouldStop else { return }
                             pump.note("appending sample")
+                            trace?.event("append.enter", fields: WriterTrace.sampleFields(sbuf).merging(
+                                ["queue": pump.queue.label]) { _, new in new })
                             if !input.append(sbuf) {
+                                trace?.event("append.return", fields: ["queue": pump.queue.label, "result": false,
+                                                                     "writerStatus": writer.status.rawValue])
                                 failure.fail(EngineError.cannotWrite(
                                     "sample append failed: \(writer.error?.localizedDescription ?? "?")"))
                                 return
                             }
-                            pump.note("sample appended", appendedPTS: CMSampleBufferGetPresentationTimeStamp(sbuf).seconds)
+                            pump.note("sample appended", appendedPTS: CMSampleBufferGetPresentationTimeStamp(sbuf).seconds,
+                                      appendedDTS: CMSampleBufferGetDecodeTimeStamp(sbuf).seconds)
+                            trace?.event("append.return", fields: ["queue": pump.queue.label, "result": true,
+                                                                 "writerStatus": writer.status.rawValue])
                             completion.noteProgress()
                         } else {
+                            trace?.event("read.return", fields: ["queue": pump.queue.label, "hasSample": false,
+                                                                "readerStatus": reader.status.rawValue])
                             if reader.status == .failed {
                                 failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
                                 return
                             }
+                            pump.note("EOF")
+                            trace?.event("EOF", fields: ["queue": pump.queue.label,
+                                                         "readerStatus": reader.status.rawValue])
                             pump.finish {
-                                if !failure.shouldStop, writer.status == .writing { input.markAsFinished() }
+                                if !failure.shouldStop, writer.status == .writing {
+                                    pump.note("markAsFinished entered")
+                                    trace?.event("markAsFinished.enter", fields: ["queue": pump.queue.label])
+                                    input.markAsFinished()
+                                    pump.note("markAsFinished returned")
+                                    trace?.event("markAsFinished.return", fields: ["queue": pump.queue.label])
+                                }
                             }
                             return
                         }
                     }
                     pump.note("not ready; waiting for next callback")
+                    trace?.event("readiness.wait", fields: ["queue": pump.queue.label,
+                                                           "ready": input.isReadyForMoreMediaData])
                 }
             }
 
             failure.activate(pumps: pumps) { error in
                 // All input queues have drained; no copy, append or normal EOF
                 // marker can overlap native cancellation or output cleanup.
-                if reader.status == .reading { reader.cancelReading() }
-                if writer.status == .writing { writer.cancelWriting() }
+                trace?.event("failure.drained", fields: ["error": error.localizedDescription,
+                    "readerStatus": reader.status.rawValue, "writerStatus": writer.status.rawValue])
+                trace?.preserveFailure(error.localizedDescription)
+                if reader.status == .reading {
+                    trace?.event("cancelReading.enter", phase: "cancelling reader")
+                    reader.cancelReading()
+                    trace?.event("cancelReading.return", fields: ["readerStatus": reader.status.rawValue])
+                }
+                if writer.status == .writing {
+                    trace?.event("cancelWriting.enter", phase: "cancelling writer")
+                    writer.cancelWriting()
+                    trace?.event("cancelWriting.return", fields: ["writerStatus": writer.status.rawValue])
+                }
+                trace?.event("completion.failure", phase: "failed")
                 completion.finish(.failure(error))
             }
             group.notify(queue: finishQueue) {
+                trace?.event("group.notify", fields: ["readerStatus": reader.status.rawValue,
+                                                      "writerStatus": writer.status.rawValue,
+                                                      "shouldStop": failure.shouldStop])
                 guard !failure.shouldStop else { return }
                 if reader.status == .failed {
                     failure.fail(EngineError.cannotRead(reader.error?.localizedDescription ?? "read failed"))
@@ -902,17 +1133,25 @@ enum LivePhotoEngine {
                     failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing failed"))
                     return
                 }
+                trace?.event("finishWriting.enter", phase: "finishing writer")
                 writer.finishWriting {
+                    trace?.event("finishWriting.callback", fields: ["writerStatus": writer.status.rawValue,
+                                                                    "shouldStop": failure.shouldStop])
                     guard !failure.shouldStop else { return }
                     if writer.status != .completed {
                         failure.fail(EngineError.cannotWrite(writer.error?.localizedDescription ?? "writing did not complete"))
                         return
                     }
-                    failure.finishSuccessfully { completion.finish(.success(())) }
+                    failure.finishSuccessfully {
+                        trace?.event("completion.success", phase: "completed")
+                        completion.finish(.success(()))
+                    }
                 }
+                trace?.event("finishWriting.return")
             }
           }
         } onCancel: {
+            trace?.event("task.cancel", phase: "draining")
             failure.fail(EngineError.cancelled)
         }
         return videoCopied

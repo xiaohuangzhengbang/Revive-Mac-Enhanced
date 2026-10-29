@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import Darwin
 @testable import Revive
 
 final class ModelParityTests: XCTestCase {
@@ -84,28 +85,108 @@ final class ModelParityTests: XCTestCase {
         let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_synthetic_six_seconds",
             withExtension: "mp4", subdirectory: "Fixtures"))
         let original = try SafeExport.sha256(source)
-        for iteration in 0..<6 {
-            let model = AppModel()
-            model.add(urls: [source])
-            let item = try XCTUnwrap(model.items.first)
-            defer { item.invalidatePreview() }
-            let deadline = Date().addingTimeInterval(20)
-            while item.state == .loading && Date() < deadline {
-                try await Task.sleep(nanoseconds: 20_000_000)
-            }
-            XCTAssertEqual(item.state, .ready)
-            item.trimStart = 1.11
-            item.trimEnd = 4.11
-            item.frameTime = 1.49
-            let prepared = await model.convert(item)
-            guard prepared else {
-                XCTFail("Native preview iteration \(iteration): \(item.state); checks=\(item.checks)")
+        var iterations = 6
+        var reuseItem = false
+        var traceDirectory: String?
+        #if DEBUG
+        let environment = ProcessInfo.processInfo.environment
+        if let configured = environment["REVIVE_STRESS_ITERATIONS"] {
+            guard let count = Int(configured), (1...1000).contains(count) else {
+                XCTFail("REVIVE_STRESS_ITERATIONS must be an integer in 1...1000")
                 return
             }
-            XCTAssertTrue(item.previewReady)
-            XCTAssertFalse(item.checks.isEmpty)
-            XCTAssertTrue(item.checks.allSatisfy { $0.status == .pass })
-            XCTAssertEqual(try SafeExport.sha256(source), original)
+            iterations = count
+        }
+        reuseItem = environment["REVIVE_STRESS_REUSE_ITEM"] == "1"
+        traceDirectory = environment["REVIVE_WRITER_TRACE_DIR"]
+        #endif
+
+        let stressID = UUID().uuidString
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        let reusedModel = reuseItem ? AppModel() : nil
+        var traceHandle: FileHandle?
+        if let directory = traceDirectory, !directory.isEmpty {
+            let root = URL(fileURLWithPath: directory, isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+            let traceURL = root.appendingPathComponent("StressIterations.jsonl")
+            if !FileManager.default.fileExists(atPath: traceURL.path) {
+                guard FileManager.default.createFile(atPath: traceURL.path, contents: nil) else {
+                    throw NSError(domain: "ReviveStressTrace", code: 1,
+                                  userInfo: [NSLocalizedDescriptionKey: "Cannot create stress iteration trace"])
+                }
+            }
+            traceHandle = try FileHandle(forWritingTo: traceURL)
+            try traceHandle?.seekToEnd()
+        }
+        defer { try? traceHandle?.close() }
+
+        func trace(_ event: String, iteration: Int, iterationStartedAt: TimeInterval,
+                   detail: String? = nil) throws {
+            let now = ProcessInfo.processInfo.systemUptime
+            var entry: [String: Any] = [
+                "event": event, "stressID": stressID, "iteration": iteration,
+                "totalIterations": iterations, "reuseItem": reuseItem,
+                "elapsedSeconds": now - startedAt,
+                "iterationSeconds": now - iterationStartedAt,
+                "timestamp": ISO8601DateFormatter().string(from: Date()),
+                "pid": ProcessInfo.processInfo.processIdentifier,
+            ]
+            if let detail { entry["detail"] = detail }
+            var data = try JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys])
+            data.append(0x0A)
+            print(String(decoding: data.dropLast(), as: UTF8.self))
+            fflush(stdout)
+            try traceHandle?.write(contentsOf: data)
+            try traceHandle?.synchronize()
+        }
+
+        for iteration in 1...iterations {
+            let iterationStartedAt = ProcessInfo.processInfo.systemUptime
+            try trace("start", iteration: iteration, iterationStartedAt: iterationStartedAt)
+            do {
+                let model = reusedModel ?? AppModel()
+                if model.items.isEmpty { model.add(urls: [source]) }
+                let item = try XCTUnwrap(model.items.first)
+                defer { item.invalidatePreview() }
+                let deadline = Date().addingTimeInterval(20)
+                while item.state == .loading && Date() < deadline {
+                    try await Task.sleep(nanoseconds: 20_000_000)
+                }
+                XCTAssertEqual(item.state, .ready)
+                guard item.state == .ready else {
+                    try trace("failed", iteration: iteration, iterationStartedAt: iterationStartedAt,
+                              detail: "Source did not become ready: \(item.state)")
+                    return
+                }
+                item.trimStart = 1.11
+                item.trimEnd = 4.11
+                item.frameTime = 1.49
+                let prepared = await model.convert(item)
+                guard prepared else {
+                    let detail = "Native preview iteration \(iteration): \(item.state); checks=\(item.checks)"
+                    XCTFail(detail)
+                    try trace("failed", iteration: iteration, iterationStartedAt: iterationStartedAt, detail: detail)
+                    return
+                }
+                let previewReady = item.previewReady
+                let checksPresent = !item.checks.isEmpty
+                let checksPassed = item.checks.allSatisfy { $0.status == .pass }
+                let currentHash = try SafeExport.sha256(source)
+                XCTAssertTrue(previewReady)
+                XCTAssertTrue(checksPresent)
+                XCTAssertTrue(checksPassed)
+                XCTAssertEqual(currentHash, original)
+                guard previewReady, checksPresent, checksPassed, currentHash == original else {
+                    try trace("failed", iteration: iteration, iterationStartedAt: iterationStartedAt,
+                              detail: "Preview, verification checks or original source hash failed")
+                    return
+                }
+                try trace("finish", iteration: iteration, iterationStartedAt: iterationStartedAt)
+            } catch {
+                try trace("failed", iteration: iteration, iterationStartedAt: iterationStartedAt,
+                          detail: error.localizedDescription)
+                throw error
+            }
         }
     }
 

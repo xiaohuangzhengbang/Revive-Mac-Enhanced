@@ -22,11 +22,12 @@ env['REVIVE_STRESS_ITERATIONS'] = str(iterations)
 env['REVIVE_WRITER_TRACE_DIR'] = str(OUT)
 environment = {'sourceCommit': env.get('GITHUB_SHA'), 'architecture': platform.machine(),
     'iterations': iterations, 'reuseItem': env.get('REVIVE_STRESS_REUSE_ITEM', '0'),
+    'testFilter': 'EngineTests|testRepeatedNativePreviewsKeepProducingVerifiedPairs',
     'startedAtUtc': datetime.now(timezone.utc).isoformat()}
 (OUT / 'Environment.json').write_text(json.dumps(environment, indent=2), encoding='utf-8')
 log_path = OUT / 'NativeStress.log'
 test_log = log_path.open('wb')
-process = subprocess.Popen(['swift', 'test', '--filter', 'testRepeatedNativePreviewsKeepProducingVerifiedPairs'],
+process = subprocess.Popen(['swift', 'test', '--filter', environment['testFilter']],
     cwd=ROOT, env=env, stdout=test_log, stderr=subprocess.STDOUT, start_new_session=True)
 started = time.monotonic()
 last_iteration = None
