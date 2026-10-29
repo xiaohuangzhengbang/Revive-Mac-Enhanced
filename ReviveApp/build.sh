@@ -31,7 +31,7 @@ plutil -insert sourcePath -string "$ROOT" "$PLIST"
 finish_receipt() { plutil -convert json -o "$RECEIPT" "$PLIST"; }
 trap finish_receipt EXIT
 
-find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -name '*.mp4' \) -exec shasum -a 256 {} \; > "$OUT/source-sha256.txt"
+find Sources Tests Support -type f \( -name '*.swift' -o -name '*.plist' -o -name '*.mp4' -o -name '*.mov' \) -exec shasum -a 256 {} \; > "$OUT/source-sha256.txt"
 swift --version > "$OUT/SwiftVersion.txt"
 swift test 2>&1 | tee "$OUT/NativeTests.log"
 plutil -insert nativeTests -string PASS "$PLIST"

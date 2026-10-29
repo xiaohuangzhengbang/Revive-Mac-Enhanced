@@ -28,6 +28,8 @@ env['REVIVE_WRITER_META_DELAY_MS'] = str(metadata_delay)
 env['REVIVE_WRITER_TRACE_DIR'] = str(OUT)
 configuration = env.get('REVIVE_DIAGNOSTIC_CONFIGURATION', 'debug') or 'debug'
 assert configuration in ('debug', 'release')
+replay = env.get('REVIVE_DIAGNOSTIC_REPLAY', '0') == '1'
+env['REVIVE_REPLAY_ITERATIONS'] = str(iterations if replay else 2)
 engine_ref = env.get('REVIVE_DIAGNOSTIC_ENGINE_REF', '')
 allowed_baselines = {'cfebf02826f2bd9790a82b62d9b1a9e506e6fe46',
                      '7e11055dd2db2942d9b29c9770fbda3a1eaeb331'}
@@ -35,15 +37,22 @@ if engine_ref:
     assert engine_ref in allowed_baselines and metadata_delay == 0
     subprocess.run(['git', 'fetch', '--depth=1', 'origin', engine_ref], cwd=ROOT, check=True)
     historical = subprocess.check_output(['git', 'show', engine_ref + ':ReviveApp/Sources/Revive/Engine.swift'], cwd=ROOT)
+    (OUT / 'OriginalCounterfactualEngine.swift.txt').write_bytes(historical)
+    if replay:
+        old = b'    private static func passthroughWrite('
+        assert historical.count(old) == 1
+        historical = historical.replace(old, b'    static func passthroughWrite(')
     (ROOT / 'Sources/Revive/Engine.swift').write_bytes(historical)
     (OUT / 'CounterfactualEngine.swift.txt').write_bytes(historical)
 environment = {'sourceCommit': env.get('GITHUB_SHA'), 'architecture': platform.machine(),
     'iterations': iterations, 'reuseItem': env.get('REVIVE_STRESS_REUSE_ITEM', '0'),
     'metadataDelayMs': metadata_delay,
     'configuration': configuration,
+    'directReplay': replay,
+    'historicalVisibilityPatchOnly': bool(engine_ref and replay),
     'engineReference': engine_ref or env.get('GITHUB_SHA'),
     'engineSourceSHA256': hashlib.sha256((ROOT / 'Sources/Revive/Engine.swift').read_bytes()).hexdigest(),
-    'testFilter': 'EngineTests|ModelParityTests',
+    'testFilter': 'testRepeatedlyRemuxesPreviouslyStalledMovie' if replay else 'EngineTests|ModelParityTests',
     'startedAtUtc': datetime.now(timezone.utc).isoformat()}
 (OUT / 'Environment.json').write_text(json.dumps(environment, indent=2), encoding='utf-8')
 log_path = OUT / 'NativeStress.log'

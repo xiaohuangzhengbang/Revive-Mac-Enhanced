@@ -821,7 +821,7 @@ enum LivePhotoEngine {
     // Returns true iff the video track was stream-copied (bit-for-bit).
 
     @discardableResult
-    private static func passthroughWrite(
+    static func passthroughWrite(
         asset: AVAsset, to url: URL, assetID: String,
         timeRange: CMTimeRange?, stillTimeAbs: CMTime, dropAudio: Bool = false,
         allowVideoReencode: Bool = true
