@@ -134,13 +134,21 @@ final class ModelParityTests: XCTestCase {
         item.coverConfirmed = true
         XCTAssertTrue(item.canDeliver)
 
+        func exportedEntries(_ directory: URL) throws -> Set<String> {
+            // Delivery intentionally reveals its files in Finder. Finder can
+            // write this view-state file asynchronously, including on CI.
+            // Keep every other unexpected file visible to the assertions.
+            Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)
+                .filter { $0 != ".DS_Store" })
+        }
+
         func inspectExport(_ directory: URL) throws -> Data {
             XCTAssertEqual(directory.deletingLastPathComponent().path, outputRoot.path)
             XCTAssertNotEqual(directory.path, preview.imageURL.deletingLastPathComponent().path)
             let image = directory.appendingPathComponent("IMG_LIVE.JPG")
             let movie = directory.appendingPathComponent("IMG_LIVE.MOV")
             let report = directory.appendingPathComponent("检查报告.json")
-            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)),
+            XCTAssertEqual(try exportedEntries(directory),
                            Set(["IMG_LIVE.JPG", "IMG_LIVE.MOV", "检查报告.json"]))
             XCTAssertEqual(try SafeExport.sha256(image), previewImageHash)
             XCTAssertEqual(try SafeExport.sha256(movie), previewMovieHash)
@@ -179,7 +187,7 @@ final class ModelParityTests: XCTestCase {
         XCTAssertNotEqual(second.path, first.path)
         _ = try inspectExport(second)
         XCTAssertEqual(try inspectExport(first), firstReport, "Second export must preserve the first report and pair")
-        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: outputRoot.path)),
+        XCTAssertEqual(try exportedEntries(outputRoot),
                        Set([first.lastPathComponent, second.lastPathComponent]))
         XCTAssertEqual(try SafeExport.sha256(source), sourceHash)
         XCTAssertEqual(try SafeExport.sha256(preview.imageURL), previewImageHash)
