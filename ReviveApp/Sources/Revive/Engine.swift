@@ -292,6 +292,7 @@ enum LivePhotoEngine {
             }
             let code = errno
             guard code == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+            guard ancestor.path != "/" else { throw POSIXError(.ENOENT) }
             let parent = ancestor.deletingLastPathComponent()
             guard parent.path != ancestor.path else { throw POSIXError(.ENOENT) }
             missing.append(ancestor.lastPathComponent)
@@ -312,6 +313,9 @@ enum LivePhotoEngine {
                 (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
                 // A new directory is allowed, but every existing ancestor is checked.
             }
+            // URL.deletingLastPathComponent() may append ".." at the volume
+            // root. The physical root has already been checked and ends the walk.
+            if current.path == "/" { return }
             let parent = current.deletingLastPathComponent()
             if parent.path == current.path { break }
             current = parent
