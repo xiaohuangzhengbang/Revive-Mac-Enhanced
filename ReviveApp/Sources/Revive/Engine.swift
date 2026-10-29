@@ -5,6 +5,7 @@ import CoreGraphics
 import ImageIO
 import UniformTypeIdentifiers
 import Foundation
+import Darwin
 
 enum EngineError: LocalizedError {
     case noVideoTrack
@@ -268,17 +269,44 @@ enum LivePhotoEngine {
             (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {
             // A missing leaf is created only after validating the canonical path.
         }
-        return url.deletingLastPathComponent().resolvingSymlinksInPath()
+        return try physicalDirectoryURL(url.deletingLastPathComponent())
             .appendingPathComponent(url.lastPathComponent, isDirectory: true)
     }
 
+    /// Foundation's path standardization can turn /private/var back into /var.
+    /// Keep the physical path from realpath, including when new parents are needed.
+    static func physicalDirectoryURL(_ url: URL) throws -> URL {
+        guard url.isFileURL, !url.path.utf8.contains(0) else {
+            throw EngineError.cannotWrite("Invalid local directory")
+        }
+        var ancestor = url
+        var missing: [String] = []
+        while true {
+            if let resolved = Darwin.realpath(ancestor.path, nil) {
+                defer { Darwin.free(resolved) }
+                var physical = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+                for component in missing.reversed() {
+                    physical.appendPathComponent(component, isDirectory: true)
+                }
+                return physical
+            }
+            let code = errno
+            guard code == ENOENT else { throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO) }
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { throw POSIXError(.ENOENT) }
+            missing.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+    }
+
     private static func validateOutputDirectory(_ url: URL) throws {
-        var current = url.standardizedFileURL
+        var current = url
         while true {
             do {
                 let attrs = try FileManager.default.attributesOfItem(atPath: current.path)
-                guard attrs[.type] as? FileAttributeType == .typeDirectory else {
-                    throw EngineError.cannotWrite("Output directory components must be real directories")
+                let type = attrs[.type] as? FileAttributeType
+                guard type == .typeDirectory else {
+                    throw EngineError.cannotWrite("Output directory components must be real directories: \(current.path) [\(type?.rawValue ?? "unknown")]")
                 }
             } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
                 (error.code == NSFileReadNoSuchFileError || error.code == NSFileNoSuchFileError) {

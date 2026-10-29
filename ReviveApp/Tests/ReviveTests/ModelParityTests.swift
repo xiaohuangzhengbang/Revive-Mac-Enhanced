@@ -95,4 +95,95 @@ final class ModelParityTests: XCTestCase {
         XCTAssertEqual(json["automaticEyeDetection"] as? Bool, false)
         XCTAssertEqual(json["applePhotosLivePlaybackVerified"] as? Bool, false)
     }
+
+    @MainActor
+    func testConfirmedPreviewExportsVerifiedPairTwiceWithoutOverwriting() async throws {
+        let source = try XCTUnwrap(Bundle.module.url(forResource: "TEST_synthetic_six_seconds",
+                                                     withExtension: "mp4", subdirectory: "Fixtures"))
+        let sourceHash = try SafeExport.sha256(source)
+        let outputRoot = try SafeExport.createOutputDirectory(
+            parent: FileManager.default.temporaryDirectory.resolvingSymlinksInPath(),
+            baseName: "ModelParityTests")
+        defer { try? FileManager.default.removeItem(at: outputRoot) }
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: outputRoot.path).isEmpty)
+
+        let model = AppModel()
+        model.outputParent = outputRoot
+        model.add(urls: [source])
+        let item = try XCTUnwrap(model.items.first)
+        defer { item.invalidatePreview() }
+        let deadline = Date().addingTimeInterval(20)
+        while item.state == .loading && Date() < deadline {
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        XCTAssertEqual(item.state, .ready)
+        item.trimStart = 1.11
+        item.trimEnd = 4.11
+        item.frameTime = 1.49
+        let converted = await model.convert(item)
+        XCTAssertTrue(converted, "Actual preview conversion failed: \(item.state)")
+        let preview = try XCTUnwrap(item.result)
+        let previewImageHash = try SafeExport.sha256(preview.imageURL)
+        let previewMovieHash = try SafeExport.sha256(preview.movURL)
+        XCTAssertEqual(item.imageSHA256, previewImageHash)
+        XCTAssertEqual(item.movieSHA256, previewMovieHash)
+        XCTAssertFalse(item.canDeliver)
+
+        // Synthetic test confirmation exercises the real delivery gate; it is
+        // not a claim that a human inspected a real person's eyes.
+        item.coverConfirmed = true
+        XCTAssertTrue(item.canDeliver)
+
+        func inspectExport(_ directory: URL) throws -> Data {
+            XCTAssertEqual(directory.deletingLastPathComponent().path, outputRoot.path)
+            XCTAssertNotEqual(directory.path, preview.imageURL.deletingLastPathComponent().path)
+            let image = directory.appendingPathComponent("IMG_LIVE.JPG")
+            let movie = directory.appendingPathComponent("IMG_LIVE.MOV")
+            let report = directory.appendingPathComponent("检查报告.json")
+            XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: directory.path)),
+                           Set(["IMG_LIVE.JPG", "IMG_LIVE.MOV", "检查报告.json"]))
+            XCTAssertEqual(try SafeExport.sha256(image), previewImageHash)
+            XCTAssertEqual(try SafeExport.sha256(movie), previewMovieHash)
+            let reportData = try Data(contentsOf: report)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: reportData) as? [String: Any])
+            XCTAssertEqual(json["status"] as? String, "FILES_VERIFIED")
+            XCTAssertEqual(json["inputUnchanged"] as? Bool, true)
+            XCTAssertEqual(json["sourceSHA256Before"] as? String, sourceHash)
+            XCTAssertEqual(json["sourceSHA256After"] as? String, sourceHash)
+            XCTAssertEqual(json["imageSHA256"] as? String, previewImageHash)
+            XCTAssertEqual(json["movieSHA256"] as? String, previewMovieHash)
+            XCTAssertEqual(json["assetIdentifier"] as? String, preview.assetID)
+            XCTAssertEqual(json["coverHumanConfirmed"] as? Bool, true)
+            XCTAssertEqual(json["previewedPairReused"] as? Bool, true)
+            XCTAssertEqual(json["applePhotosLivePlaybackVerified"] as? Bool, false)
+            let checks = try XCTUnwrap(json["checks"] as? [[String: Any]])
+            XCTAssertFalse(checks.isEmpty)
+            XCTAssertTrue(checks.allSatisfy { $0["status"] as? String == "pass" })
+            return reportData
+        }
+
+        await model.convertAndDeliver(item, to: .folder)
+        XCTAssertEqual(item.state, .done)
+        XCTAssertEqual(model.activeOperations, 0)
+        XCTAssertFalse(item.savedToLibrary)
+        let first = try XCTUnwrap(item.exportDirectory)
+        let firstReport = try inspectExport(first)
+        XCTAssertEqual(try SafeExport.sha256(source), sourceHash)
+        XCTAssertTrue(item.canDeliver)
+
+        await model.convertAndDeliver(item, to: .folder)
+        XCTAssertEqual(item.state, .done)
+        XCTAssertEqual(model.activeOperations, 0)
+        XCTAssertFalse(item.savedToLibrary)
+        let second = try XCTUnwrap(item.exportDirectory)
+        XCTAssertNotEqual(second.path, first.path)
+        _ = try inspectExport(second)
+        XCTAssertEqual(try inspectExport(first), firstReport, "Second export must preserve the first report and pair")
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: outputRoot.path)),
+                       Set([first.lastPathComponent, second.lastPathComponent]))
+        XCTAssertEqual(try SafeExport.sha256(source), sourceHash)
+        XCTAssertEqual(try SafeExport.sha256(preview.imageURL), previewImageHash)
+        XCTAssertEqual(try SafeExport.sha256(preview.movURL), previewMovieHash)
+        XCTAssertEqual(item.result?.assetID, preview.assetID)
+    }
 }

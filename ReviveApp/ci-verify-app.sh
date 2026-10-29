@@ -98,17 +98,18 @@ REVIVE_LANG=en "$DEBUG_BIN" --ui-smoke \
   "$PROJECT_ROOT/Tests/ReviveTests/Fixtures/TEST_synthetic_six_seconds.mp4" \
   "$SNAPSHOT" > "$EVIDENCE/NativeUISmoke.log" 2>&1 &
 DEBUG_PID=$!
-for ((second = 0; second < 45; second++)); do
+for ((second = 0; second < 75; second++)); do
   kill -0 "$DEBUG_PID" 2>/dev/null || break
   sleep 1
 done
 if kill -0 "$DEBUG_PID" 2>/dev/null; then
-  echo "Native UI rendering exceeded 45 seconds." >&2
+  echo "Native UI rendering and actual preview exceeded 75 seconds." >&2
   exit 1
 fi
 wait "$DEBUG_PID"
 DEBUG_PID=""
 grep -q 'UI smoke OK' "$EVIDENCE/NativeUISmoke.log"
+grep -q 'actual JPG/MOV preview verified' "$EVIDENCE/NativeUISmoke.log"
 [[ -s "$SNAPSHOT" ]]
 sips -g pixelWidth -g pixelHeight "$SNAPSHOT" > "$EVIDENCE/NativeUISnapshotDimensions.txt"
 plutil -insert debugNativeUIRendering -string PNG_RENDERED "$PLIST"

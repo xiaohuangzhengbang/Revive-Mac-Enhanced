@@ -137,21 +137,25 @@ final class QueueItem: ObservableObject, Identifiable {
 /// One process owns one random scratch root. Never sweep another running app.
 @MainActor
 enum TempStore {
-    private static let session = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().standardizedFileURL
-        .appendingPathComponent("Revive-\(UUID().uuidString)", isDirectory: true)
-    private static var created = false
+    private static var session: URL?
 
     static func makeOperationDirectory() throws -> URL {
-        if !created {
-            try FileManager.default.createDirectory(at: session, withIntermediateDirectories: false)
-            created = true
+        let root: URL
+        if let session {
+            root = session
+        } else {
+            root = try LivePhotoEngine.physicalDirectoryURL(FileManager.default.temporaryDirectory)
+                .appendingPathComponent("Revive-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+            Self.session = root
         }
-        return try SafeExport.createOutputDirectory(parent: session, baseName: "Preview")
+        return try SafeExport.createOutputDirectory(parent: root, baseName: "Preview")
     }
 
     static func removeDirectory(_ directory: URL) {
-        let path = directory.standardizedFileURL.path
-        guard created, path.hasPrefix(session.path + "/"), directory.deletingLastPathComponent() == session else { return }
+        guard let session else { return }
+        let path = directory.path
+        guard path.hasPrefix(session.path + "/"), directory.deletingLastPathComponent().path == session.path else { return }
         try? FileManager.default.removeItem(at: directory)
     }
 
@@ -162,9 +166,9 @@ enum TempStore {
     }
 
     static func sweep() {
-        guard created else { return }
+        guard let session else { return }
         try? FileManager.default.removeItem(at: session)
-        created = false
+        Self.session = nil
     }
 }
 

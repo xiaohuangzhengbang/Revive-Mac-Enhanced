@@ -122,6 +122,38 @@ enum Main {
                 .environmentObject(Localizer.shared))
             host.frame = NSRect(x: 0, y: 0, width: 1000, height: 700)
             host.layoutSubtreeIfNeeded()
+            if args.count > idx + 1 {
+                guard let item = model.items.first else {
+                    print("UI smoke FAILED: fixture was not added")
+                    exit(1)
+                }
+                let loadDeadline = Date().addingTimeInterval(20)
+                while item.state == .loading && Date() < loadDeadline {
+                    RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                }
+                guard item.state == .ready else {
+                    print("UI smoke FAILED: fixture did not load")
+                    exit(1)
+                }
+                var prepared = false
+                var preparationFinished = false
+                Task { @MainActor in
+                    prepared = await model.convert(item)
+                    preparationFinished = true
+                }
+                let prepareDeadline = Date().addingTimeInterval(30)
+                while !preparationFinished && Date() < prepareDeadline {
+                    RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+                    host.layoutSubtreeIfNeeded()
+                }
+                guard preparationFinished, prepared, item.previewReady,
+                      item.coverImage != nil, !item.checks.isEmpty,
+                      item.checks.allSatisfy({ $0.status == .pass }) else {
+                    print("UI smoke FAILED: actual JPG/MOV preview was not verified")
+                    exit(1)
+                }
+                print("UI smoke: actual JPG/MOV preview verified; human cover confirmation remains false")
+            }
             let deadline = Date().addingTimeInterval(3)
             while Date() < deadline {
                 RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
@@ -137,6 +169,8 @@ enum Main {
                     }
                 }
             }
+            for item in model.items { item.invalidatePreview() }
+            TempStore.sweep()
             print("UI smoke OK — items: \(model.items.count)")
             exit(0)
         }

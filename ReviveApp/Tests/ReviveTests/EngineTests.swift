@@ -2,6 +2,7 @@ import XCTest
 import AVFoundation
 import ImageIO
 import CoreGraphics
+import Darwin
 @testable import Revive
 
 /// End-to-end tests for the conversion engine. Each test generates a real H.264
@@ -254,7 +255,8 @@ final class EngineTests: XCTestCase {
         let requested = parentAlias.appendingPathComponent("pair", isDirectory: true)
         let result = try await LivePhotoEngine.convert(input: src, outputDir: requested,
             baseName: "PAIR", settings: ConversionSettings())
-        let expected = realParent.appendingPathComponent("pair", isDirectory: true)
+        let expected = URL(fileURLWithPath: try physicalPath(realParent.appendingPathComponent("pair", isDirectory: true)),
+                           isDirectory: true)
         XCTAssertEqual(result.imageURL.deletingLastPathComponent().path, expected.path)
         XCTAssertTrue(FileManager.default.fileExists(atPath: requested.appendingPathComponent("PAIR.JPG").path))
         XCTAssertTrue(FileManager.default.fileExists(atPath: requested.appendingPathComponent("PAIR.MOV").path))
@@ -271,6 +273,48 @@ final class EngineTests: XCTestCase {
             XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: expected.path)),
                            Set(["PAIR.JPG", "PAIR.MOV"]))
         }
+    }
+
+    func testCreatesNestedMissingDirectoriesBelowSymlinkedParent() async throws {
+        let source = tmp.appendingPathComponent("nested-source.mp4")
+        try makeTestVideo(at: source)
+        let original = try Data(contentsOf: source)
+        let realParent = tmp.appendingPathComponent("nested-parent", isDirectory: true)
+        try FileManager.default.createDirectory(at: realParent, withIntermediateDirectories: false)
+        let parentAlias = tmp.appendingPathComponent("nested-parent-alias", isDirectory: true)
+        try FileManager.default.createSymbolicLink(at: parentAlias, withDestinationURL: realParent)
+        let output = parentAlias.appendingPathComponent("missing/also-missing/pair", isDirectory: true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+
+        let result = try await LivePhotoEngine.convert(input: source, outputDir: output,
+            baseName: "NESTED", settings: ConversionSettings())
+        let expectedPath = try physicalPath(realParent.appendingPathComponent("missing/also-missing/pair", isDirectory: true))
+        XCTAssertEqual(result.imageURL.deletingLastPathComponent().path, expectedPath)
+        XCTAssertEqual(result.movURL.deletingLastPathComponent().path, expectedPath)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        XCTAssertEqual(Set(try FileManager.default.contentsOfDirectory(atPath: expectedPath)),
+                       Set(["NESTED.JPG", "NESTED.MOV"]))
+        let checks = await Verifier.verify(imageURL: result.imageURL, movURL: result.movURL,
+            expectedDuration: 1, expectedStillTime: result.stillTime, expectedAudio: false)
+        for check in checks { XCTAssertEqual(check.status, .pass, "\(check.code): \(check.detail)") }
+    }
+
+    @MainActor
+    func testTempStoreRemovesCanonicalOperationDirectory() async throws {
+        let directory = try TempStore.makeOperationDirectory()
+        defer { TempStore.removeDirectory(directory) }
+        let canonical = URL(fileURLWithPath: try physicalPath(directory), isDirectory: true)
+        XCTAssertEqual(directory.path, canonical.path)
+        TempStore.removeDirectory(canonical)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    }
+
+    private func physicalPath(_ url: URL) throws -> String {
+        guard let resolved = Darwin.realpath(url.path, nil) else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        defer { Darwin.free(resolved) }
+        return String(cString: resolved)
     }
 
     private func stillMetadataRange(_ url: URL) async throws -> CMTimeRange {

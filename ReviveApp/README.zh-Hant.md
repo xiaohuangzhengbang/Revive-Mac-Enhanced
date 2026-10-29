@@ -1,4 +1,4 @@
-> 本分支為尚未在 Mac 構建的增強版原始碼；目前狀態與新構建入口請參照 [README.md](README.md)。舊版 --install 入口已移除，構建不會覆蓋既有應用。
+> 本分支的 Mac 原生增強功能、GitHub Actions 建置與實際驗收範圍請以 [README.md](README.md) 為準。下方保留上游原版說明；增強版建置腳本預設只產出新套件，不執行安裝或覆寫既有應用。
 
 # Revive App
 

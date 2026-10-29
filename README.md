@@ -1,4 +1,4 @@
-> 当前任务分支包含 Mac 原生增强源码候选：默认精准剪辑，新增成片封面确认和安全导出。增强版尚未在 Mac 构建或运行；状态和新构建命令见 [ReviveApp/README.md](ReviveApp/README.md)。下方官方发行版说明不代表增强版已经交付。
+> 本工作分支提供 Mac 原生增强版：默认精准截取 3 秒、实际成片 JPG 封面预览与确认、保留原片、新建独立输出文件夹和 JPG/MOV 检查。GitHub Actions 在 Intel 与 Apple Silicon 上运行完整原生测试、构建通用 .app、验证 ad hoc 签名与打包后启动；具体结果以对应提交的 Actions 记录为准。构建和使用说明见 [ReviveApp/README.md](ReviveApp/README.md)。下方保留上游原版说明。
 
 # Revive
 
