@@ -6,7 +6,6 @@ import AVFoundation
 import ScreenCaptureKit
 import CoreText
 import ImageIO
-import ApplicationServices
 
 private func tutorialError(_ message: String) -> NSError {
     NSError(domain: "ReviveRealTutorial", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
@@ -183,8 +182,8 @@ final class RealTutorial: ObservableObject {
                 return
             }
             // SwiftUI's virtual accessibility children need not formally adopt
-            // NSAccessibilityProtocol. Ask the system AX bridge off the main
-            // thread, so its request can be serviced by this app's main loop.
+            // NSAccessibilityProtocol. Ask a genuinely separate AX helper
+            // process, so SwiftUI dispatches requests onto this app's main loop.
             // AXPress still invokes the actual control; no model action is used.
             let remote = await Task.detached(priority: .userInitiated) {
                 Self.remotePress(title: title)
@@ -204,43 +203,26 @@ final class RealTutorial: ObservableObject {
     }
 
     private nonisolated static func remotePress(title: String) -> [String: Any] {
-        let app = AXUIElementCreateApplication(ProcessInfo.processInfo.processIdentifier)
-        AXUIElementSetMessagingTimeout(app, 2)
-        let enhanced = AXUIElementSetAttributeValue(app, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
-        let manual = AXUIElementSetAttributeValue(app, "AXManualAccessibility" as CFString, kCFBooleanTrue)
-        func value(_ element: AXUIElement, _ key: String) -> CFTypeRef? {
-            var result: CFTypeRef?
-            guard AXUIElementCopyAttributeValue(element, key as CFString, &result) == .success else { return nil }
+        let helper = Bundle.main.bundleURL.deletingLastPathComponent().appendingPathComponent("ReviveTutorialAX")
+        let process = Process()
+        process.executableURL = helper
+        process.arguments = [String(ProcessInfo.processInfo.processIdentifier), title]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.standardError
+        do {
+            try process.run()
+            // Reading before waiting drains large failure diagnostics without a
+            // pipe deadlock. This helper runs on a detached worker; UI stays live.
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return ["pressed": false, "error": "AX helper returned non-object JSON"]
+            }
             return result
+        } catch {
+            return ["pressed": false, "error": "Separate AX helper failed: \(error.localizedDescription)"]
         }
-        var queue: [(AXUIElement, Int)] = [(app, 0)]
-        var index = 0
-        var rows: [[String: Any]] = []
-        while index < queue.count && index < 5000 {
-            let (element, depth) = queue[index]
-            index += 1
-            let role = value(element, kAXRoleAttribute) as? String ?? ""
-            let parts = [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute, kAXValueAttribute]
-                .compactMap { value(element, $0) as? String }
-            let text = parts.joined(separator: " ")
-            let enabled = (value(element, kAXEnabledAttribute) as? NSNumber)?.boolValue ?? false
-            rows.append(["role": role, "text": text, "enabled": enabled, "depth": depth])
-            if (role == kAXButtonRole || role == kAXCheckBoxRole), enabled, text.contains(title) {
-                let result = AXUIElementPerformAction(element, kAXPressAction as CFString)
-                return ["pressed": result == .success, "pressResult": result.rawValue,
-                        "enhancedResult": enhanced.rawValue, "manualResult": manual.rawValue,
-                        "matchedRole": role, "matchedText": text]
-            }
-            if depth < 32 {
-                for key in [kAXWindowsAttribute, kAXChildrenAttribute, kAXContentsAttribute] {
-                    if let children = value(element, key) as? [AXUIElement] {
-                        queue.append(contentsOf: children.map { ($0, depth + 1) })
-                    }
-                }
-            }
-        }
-        return ["pressed": false, "enhancedResult": enhanced.rawValue,
-                "manualResult": manual.rawValue, "searchedNodes": index, "nodes": rows]
     }
     private func waitUntil(_ description: String, seconds: Double = 100, _ condition: () -> Bool) async throws {
         let deadline = Date().addingTimeInterval(seconds)

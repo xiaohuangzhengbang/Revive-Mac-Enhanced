@@ -13,7 +13,7 @@ cd "$PROJECT"
 
 # Exact source provenance: the production sources must still be the tested
 # release sources. CI-only files are excluded from this comparison.
-APP_COMMIT=0b7694c5f1c7c900a00b45f8e6e2dca5ea174474
+APP_COMMIT=e67824ef4c087a98ba0cbb58a6800f2582260b1d
 git diff --exit-code "$APP_COMMIT" -- Sources/Revive
 export REVIVE_APP_SOURCE_COMMIT="$APP_COMMIT"
 git rev-parse HEAD > "$OUT/logs/TutorialSourceCommit.txt"
@@ -50,12 +50,15 @@ swiftc -D DEBUG -parse-as-library -target "$(uname -m)-apple-macosx15.0" \
   "${sources[@]}" ci-real-tutorial.swift \
   -o "$APP/Contents/MacOS/ReviveTutorial" 2>&1 | tee "$OUT/logs/Compile.log"
 codesign --force --sign - --identifier com.revive.ci.real-tutorial "$APP" 2> "$OUT/logs/Signature.log"
+swiftc -parse-as-library -target "$(uname -m)-apple-macosx15.0" \
+  ci-real-tutorial-ax.swift -o "$OUT/ReviveTutorialAX" 2>&1 | tee "$OUT/logs/AXHelperCompile.log"
+codesign --force --sign - --identifier com.revive.ci.real-tutorial.ax "$OUT/ReviveTutorialAX" 2>> "$OUT/logs/Signature.log"
 
 # The temporary runner belongs to this single CI job. Scope the permission to
 # this signed CI-only app so an unattended recording does not wait on a TCC
 # prompt. Never execute this on the user's computer. Schema is introspected
 # rather than assuming a macOS-version-specific INSERT column layout.
-sudo python3 - "$APP" > "$OUT/logs/EphemeralRunnerScreenPermission.json" <<'PY'
+sudo python3 - "$APP" "$OUT/ReviveTutorialAX" > "$OUT/logs/EphemeralRunnerScreenPermission.json" <<'PY'
 import json, sqlite3, sys, time
 path = '/Library/Application Support/com.apple.TCC/TCC.db'
 db = sqlite3.connect(path)
@@ -65,10 +68,15 @@ values = {'service':'kTCCServiceScreenCapture', 'client':'com.revive.ci.real-tut
           'indirect_object_identifier_type':0, 'indirect_object_identifier':'UNUSED',
           'flags':0, 'last_modified':int(time.time()), 'pid':0, 'pid_version':0,
           'boot_uuid':'UNUSED', 'last_reminded':int(time.time())}
-keys = [k for k in columns if k in values]
-db.execute('insert or replace into access (' + ','.join(keys) + ') values (' + ','.join('?' for _ in keys) + ')', [values[k] for k in keys])
+grants = [('kTCCServiceScreenCapture','com.revive.ci.real-tutorial',0),
+          ('kTCCServiceAccessibility','com.revive.ci.real-tutorial',0),
+          ('kTCCServiceAccessibility',sys.argv[2],1)]
+for service,client,client_type in grants:
+    values.update(service=service,client=client,client_type=client_type)
+    keys = [k for k in columns if k in values]
+    db.execute('insert or replace into access (' + ','.join(keys) + ') values (' + ','.join('?' for _ in keys) + ')', [values[k] for k in keys])
 db.commit()
-rows = db.execute("select service,client,auth_value from access where service=? and client=?", ('kTCCServiceScreenCapture','com.revive.ci.real-tutorial')).fetchall()
+rows = db.execute("select service,client,auth_value from access where client in (?,?)", ('com.revive.ci.real-tutorial',sys.argv[2])).fetchall()
 print(json.dumps({'scope':'ephemeral public GitHub-hosted runner only', 'permissions':rows}))
 PY
 
@@ -88,6 +96,10 @@ native_status=0
 wait "$PID" || native_status=$?
 cat "$OUT/logs/NativeTutorial.log"
 if [[ $native_status -ne 0 ]]; then
+  mkdir -p "$OUT/logs/CrashReports"
+  for report in "$HOME"/Library/Logs/DiagnosticReports/ReviveTutorial*.ips "$HOME"/Library/Logs/DiagnosticReports/ReviveTutorial*.crash; do
+    if [[ -f "$report" ]]; then cp -p "$report" "$OUT/logs/CrashReports/"; fi
+  done
   echo "Native tutorial exited with status $native_status; inspect failure JSON and actual screen evidence." >&2
   exit "$native_status"
 fi
