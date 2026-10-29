@@ -19,9 +19,13 @@ iterations = int(os.environ.get('REVIVE_STRESS_ITERATIONS', '40'))
 assert 1 <= iterations <= 1000
 env = os.environ.copy()
 env['REVIVE_STRESS_ITERATIONS'] = str(iterations)
+metadata_delay = int(env.get('REVIVE_WRITER_META_DELAY_MS', '0') or '0')
+assert 0 <= metadata_delay <= 250
+env['REVIVE_WRITER_META_DELAY_MS'] = str(metadata_delay)
 env['REVIVE_WRITER_TRACE_DIR'] = str(OUT)
 environment = {'sourceCommit': env.get('GITHUB_SHA'), 'architecture': platform.machine(),
     'iterations': iterations, 'reuseItem': env.get('REVIVE_STRESS_REUSE_ITEM', '0'),
+    'metadataDelayMs': metadata_delay,
     'testFilter': 'EngineTests|testRepeatedNativePreviewsKeepProducingVerifiedPairs',
     'startedAtUtc': datetime.now(timezone.utc).isoformat()}
 (OUT / 'Environment.json').write_text(json.dumps(environment, indent=2), encoding='utf-8')

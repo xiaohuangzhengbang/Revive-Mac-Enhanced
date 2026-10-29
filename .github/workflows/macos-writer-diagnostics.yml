@@ -12,6 +12,10 @@ on:
         required: true
         type: boolean
         default: false
+      metadata_delay_ms:
+        description: DEBUG scheduling experiment, metadata callback delay (0-250 ms)
+        required: true
+        default: '0'
 
 permissions:
   contents: read
@@ -43,6 +47,7 @@ jobs:
         env:
           REVIVE_STRESS_ITERATIONS: ${{ inputs.iterations }}
           REVIVE_STRESS_REUSE_ITEM: ${{ inputs.reuse_item && '1' || '0' }}
+          REVIVE_WRITER_META_DELAY_MS: ${{ inputs.metadata_delay_ms }}
         run: python3 ReviveApp/ci-diagnose-writer.py
       - name: Preserve diagnostics even when the native process fails or hangs
         if: always()

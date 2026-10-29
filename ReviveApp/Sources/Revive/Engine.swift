@@ -977,6 +977,28 @@ enum LivePhotoEngine {
           try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let group = DispatchGroup()
             let metaPump = WritePump(label: "revive.meta", group: group)
+            #if DEBUG
+            if let trace {
+                let requestedDelay = Int(ProcessInfo.processInfo.environment["REVIVE_WRITER_META_DELAY_MS"] ?? "0") ?? 0
+                let delay = (0...250).contains(requestedDelay) ? requestedDelay : 0
+                trace.event("metadata.delay.configured", fields: ["delayMs": delay,
+                                                                 "initialReady": metaInput.isReadyForMoreMediaData])
+                if delay > 0, pairs.contains(where: { $0.1.mediaType == .audio }) {
+                    // Controlled scheduling experiment only: register the native
+                    // callback normally while delaying execution on its queue.
+                    // The independent one-shot always balances this suspension,
+                    // including when cancellation arrives before registration.
+                    let metadataQueue = metaPump.queue
+                    metadataQueue.suspend()
+                    trace.event("metadata.delay.scheduled", fields: ["delayMs": delay])
+                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(delay)) {
+                        metadataQueue.resume()
+                        trace.event("metadata.delay.resume", fields: ["delayMs": delay,
+                                                                      "readyAfterResume": metaInput.isReadyForMoreMediaData])
+                    }
+                }
+            }
+            #endif
             let mediaPumps = pairs.enumerated().map { index, pair in
                 WritePump(label: "revive.pump.\(index).\(pair.1.mediaType.rawValue)", group: group)
             }
